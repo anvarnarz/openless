@@ -15,9 +15,10 @@ import { ja } from './ja';
 import { ko } from './ko';
 import { zhCN } from './zh-CN';
 import { zhTW } from './zh-TW';
+import { uz } from './uz';
 import type { UserPreferences } from '../lib/types';
 
-export const SUPPORTED_LOCALES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko'] as const;
+export const SUPPORTED_LOCALES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'uz'] as const;
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
 
 export const LOCALE_STORAGE_KEY = 'ol.locale';
@@ -32,6 +33,7 @@ function detectSystemLocale(): SupportedLocale {
   }
   if (nav.startsWith('ja')) return 'ja';
   if (nav.startsWith('ko')) return 'ko';
+  if (nav.startsWith('uz')) return 'uz';
   return 'en';
 }
 
@@ -43,7 +45,7 @@ function resolveLocalePreference(pref: SupportedLocale | typeof FOLLOW_SYSTEM_VA
 function getStoredLocale(): SupportedLocale | null {
   if (typeof window === 'undefined') return null;
   const raw = window.localStorage.getItem(LOCALE_STORAGE_KEY);
-  return raw === 'zh-CN' || raw === 'zh-TW' || raw === 'en' || raw === 'ja' || raw === 'ko' ? raw : null;
+  return raw === 'zh-CN' || raw === 'zh-TW' || raw === 'en' || raw === 'ja' || raw === 'ko' || raw === 'uz' ? raw : null;
 }
 
 const initialLng: SupportedLocale = getStoredLocale() ?? detectSystemLocale();
@@ -55,9 +57,10 @@ void i18n.use(initReactI18next).init({
     en: { translation: en },
     ja: { translation: ja },
     ko: { translation: ko },
+    uz: { translation: uz },
   },
   lng: initialLng,
-  fallbackLng: 'zh-CN',
+  fallbackLng: 'uz',
   supportedLngs: SUPPORTED_LOCALES as unknown as string[],
   partialBundledLanguages: true, // 告诉 i18next 我们的内联资源已完整，无需 backend 拉取
   interpolation: { escapeValue: false },
@@ -124,6 +127,12 @@ export function outputPrefsForLocale(
     return {
       chineseScriptPreference: 'auto',
       outputLanguagePreference: 'ko',
+    };
+  }
+  if (resolved === 'uz') {
+    return {
+      chineseScriptPreference: 'auto',
+      outputLanguagePreference: 'auto',
     };
   }
   return {

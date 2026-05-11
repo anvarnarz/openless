@@ -253,19 +253,40 @@ fn creds_default_asr() -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        "volcengine".into()
+        "whisper".into()
     }
 }
 fn creds_default_llm() -> String {
-    "ark".into()
+    "gemini".into()
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct CredsProviders {
     #[serde(default)]
     asr: HashMap<String, CredsAsrEntry>,
     #[serde(default)]
     llm: HashMap<String, CredsLlmEntry>,
+}
+
+impl Default for CredsProviders {
+    fn default() -> Self {
+        let mut llm = HashMap::new();
+        llm.insert(
+            "gemini".to_string(),
+            CredsLlmEntry {
+                baseURL: Some(
+                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+                        .to_string(),
+                ),
+                model: Some("gemini-2.5-flash".to_string()),
+                ..Default::default()
+            },
+        );
+        Self {
+            asr: HashMap::new(),
+            llm,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

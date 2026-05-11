@@ -2493,6 +2493,7 @@ function LanguageSection() {
           <option value="en">{t('settings.language.en')}</option>
           <option value="ja">{t('settings.language.ja')}</option>
           <option value="ko">{t('settings.language.ko')}</option>
+          <option value="uz">O&apos;zbekcha</option>
         </select>
       </SettingRow>
       <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 8, lineHeight: 1.6 }}>

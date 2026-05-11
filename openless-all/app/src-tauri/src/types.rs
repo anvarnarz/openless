@@ -305,7 +305,7 @@ fn default_active_asr_provider() -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        "volcengine".into()
+        "whisper".into()
     }
 }
 
@@ -547,13 +547,13 @@ impl Default for UserPreferences {
             mute_during_recording: false,
             microphone_device_name: String::new(),
             active_asr_provider: default_active_asr_provider(),
-            active_llm_provider: "ark".into(),
+            active_llm_provider: "gemini".into(),
             llm_thinking_enabled: false,
             restore_clipboard_after_paste: true,
             paste_shortcut: PasteShortcut::default(),
             allow_non_tsf_insertion_fallback: true,
             working_languages: default_working_languages(),
-            translation_target_language: String::new(),
+            translation_target_language: "English".into(),
             chinese_script_preference: ChineseScriptPreference::Auto,
             output_language_preference: OutputLanguagePreference::Auto,
             qa_hotkey: default_qa_hotkey(),

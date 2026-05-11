@@ -573,6 +573,7 @@ function LanguagePicker() {
       <option value="en">{t('settings.language.en')}</option>
       <option value="ja">{t('settings.language.ja')}</option>
       <option value="ko">{t('settings.language.ko')}</option>
+      <option value="uz">O&apos;zbekcha</option>
     </select>
   );
 }
