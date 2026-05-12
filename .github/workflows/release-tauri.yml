@@ -490,20 +490,30 @@ jobs:
           # 多次调用 action 时内容一致、idempotent。提示 macOS Gatekeeper 绕过指令 +
           # 渠道说明，每个 release 自动带上，用户不用回项目 README 翻就能看到。
           body: |
-            ### macOS 用户首次安装提示
+            ### macOS o'rnatish bo'yicha muhim eslatma
 
-            下载 DMG 拖入 `/Applications` 后，**必须**在终端运行：
+            DMG faylini yuklab olib `/Applications` papkasiga ko'chirganingizdan so'ng, **Terminal da quyidagi buyruqni ishga tushiring:**
 
             ```bash
             xattr -cr /Applications/OpenLess.app
             ```
 
-            否则 Gatekeeper 会提示「OpenLess 已损坏」——这是因为当前 build 用 ad-hoc 签名、没做 Apple 公证。
+            Bu buyruqsiz Gatekeeper «OpenLess shikastlangan» degan xabar ko'rsatishi mumkin — bu ilova ad-hoc imzolangani va Apple tomonidan notarizatsiya qilinmagani sababli yuz beradi.
 
-            ### 渠道说明
+            ### Windows o'rnatish
 
-            - 以 `-tauri` 结尾的 tag 是**正式版**（自动推送给所有 in-app 检查更新的用户）。
-            - 以 `-beta-tauri` 结尾的 tag 是 **Beta 版**（GitHub 标 pre-release，**不**通过 in-app updater 推送给正式版用户；只对在「设置 → 关于 → 加入 Beta 渠道」开关切到 Beta 的用户可见，且需要手动从此页面下载安装）。
+            `.exe` faylini yuklab oling va o'rnatuvchini ishga tushiring. SmartScreen ogorhlantirishi chiqsa — «Qo'shimcha ma'lumot» → «Baribir ishga tushirish» tugmasini bosing.
+
+            ### Sozlash
+
+            Ilovani ishlatish uchun Settings bo'limida ikkita API kalitini kiriting:
+            - **Whisper ASR** — nutqni matnga aylantirish uchun (OpenAI API kaliti)
+            - **Gemini Polish** — matn tahriri uchun (Google AI Studio API kaliti)
+
+            ### Versiya kanali
+
+            - `-tauri` bilan tugaydigan tag — **barqaror versiya** (barcha foydalanuvchilarga avtomatik yangilanish yuboriladi).
+            - `-beta-tauri` bilan tugaydigan tag — **Beta versiya** (GitHub pre-release sifatida belgilanadi; avtomatik yangilanish orqali barqaror versiya foydalanuvchilariga yuborilmaydi).
 
           append_body: true
           # Matrix jobs all upload assets to the same release. Generate notes once
