@@ -21,14 +21,6 @@ import {
   type LatestBetaRelease,
   type UpdateChannel,
 } from '../lib/ipc';
-import {
-  FOLLOW_SYSTEM,
-  getLocalePreference,
-  outputPrefsForLocale,
-  setLocalePreference,
-  type SupportedLocale,
-} from '../i18n';
-import { useHotkeySettings } from '../state/HotkeySettingsContext';
 import type { OS } from './WindowChrome';
 
 interface SettingsModalProps {
@@ -264,9 +256,6 @@ function PersonalizeSection() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Row label={t('modal.personalize.language')}>
-        <LanguagePicker />
-      </Row>
       <Row label={t('modal.personalize.font')} desc={t('modal.personalize.fontDesc')}>
         <div style={{ display: 'flex', gap: 4, padding: 2, background: 'rgba(0,0,0,0.04)', borderRadius: 8 }}>
           {fontOptions.map(([id, label]) => {
@@ -533,47 +522,3 @@ const btnGhost: CSSProperties = {
   transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick)',
 };
 
-// 真正可用的语言切换器 —— 用原生 <select>，与 Settings → Language 分区共享同一份 localStorage 偏好。
-function LanguagePicker() {
-  const { t } = useTranslation();
-  const { updatePrefs } = useHotkeySettings();
-  const [pref, setPref] = useState<SupportedLocale | typeof FOLLOW_SYSTEM>(getLocalePreference());
-
-  const apply = async (next: SupportedLocale | typeof FOLLOW_SYSTEM) => {
-    setPref(next);
-    const resolved = await setLocalePreference(next);
-    const localePrefs = outputPrefsForLocale(resolved);
-    await updatePrefs(current => {
-      if (
-        current.chineseScriptPreference === localePrefs.chineseScriptPreference &&
-        current.outputLanguagePreference === localePrefs.outputLanguagePreference
-      ) {
-        return current;
-      }
-      return { ...current, ...localePrefs };
-    });
-  };
-
-  return (
-    <select
-      value={pref}
-      onChange={e => apply(e.target.value as SupportedLocale | typeof FOLLOW_SYSTEM)}
-      style={{
-        height: 32, padding: '0 10px',
-        border: '0.5px solid var(--ol-line-strong)',
-        borderRadius: 8, fontSize: 12.5,
-        fontFamily: 'inherit', outline: 'none',
-        background: 'var(--ol-surface-2)',
-        minWidth: 200, cursor: 'default',
-      }}
-    >
-      <option value={FOLLOW_SYSTEM}>{t('settings.language.followSystem')}</option>
-      <option value="zh-CN">{t('settings.language.zh')}</option>
-      <option value="zh-TW">{t('settings.language.zhTW')}</option>
-      <option value="en">{t('settings.language.en')}</option>
-      <option value="ja">{t('settings.language.ja')}</option>
-      <option value="ko">{t('settings.language.ko')}</option>
-      <option value="uz">O&apos;zbekcha</option>
-    </select>
-  );
-}

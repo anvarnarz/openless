@@ -1,69 +1,45 @@
 // Settings.tsx — ported verbatim from design_handoff_openless/pages.jsx::Settings.
-// Internal sub-sections (Recording / Providers / Shortcuts / Permissions / Language / About)
-// keep their inline-style literals 1:1 with the source JSX.
+// Section 拆分见 settings/ 子目录；本文件保留 dispatcher + RecordingSection + ProvidersSection（含其内嵌助手），
+// 其他 section 已挪出。原导出 Toggle / AboutUpdateControl / SettingsSectionId 通过 re-export 维持向后兼容。
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '../components/Icon';
 import { ShortcutRecorder } from '../components/ShortcutRecorder';
-import { isDialogStatus, UpdateDialog, useAutoUpdate } from '../components/AutoUpdate';
 import { detectOS } from '../components/WindowChrome';
-import { LocalAsr } from './LocalAsr';
-import { APP_VERSION_LABEL } from '../lib/appVersion';
 import { isHotkeyModeMigrationNoticeActive } from '../lib/hotkeyMigration';
 import {
-  defaultQaShortcut,
   getHotkeyBindingCodes,
   getHotkeyBindingLabel,
   getHotkeyCodeLabel,
 } from '../lib/hotkey';
 import { createHotkeyRecorderState, orderHotkeyCodes, updateHotkeyRecorderState } from '../lib/hotkeyRecorder';
 import {
-  checkAccessibilityPermission,
-  checkMicrophonePermission,
-  getHotkeyStatus,
-  getWindowsImeStatus,
   isTauri,
+  isWaylandCliMode,
   listMicrophoneDevices,
   openExternal,
-  openSystemSettings,
   listProviderModels,
   readCredential,
-  requestAccessibilityPermission,
-  requestMicrophonePermission,
   setActiveAsrProvider,
   setActiveLlmProvider,
   setCredential,
   setDictationHotkey,
-  setOpenAppHotkey,
-  setQaHotkey,
-  setSwitchStyleHotkey,
-  setTranslationHotkey,
   startMicrophoneLevelMonitor,
   stopMicrophoneLevelMonitor,
   validateProviderCredentials,
 } from '../lib/ipc';
 import type {
-  HotkeyCapability,
   HotkeyBinding,
   HotkeyMode,
-  HotkeyStatus,
   HotkeyTrigger,
   MicrophoneDevice,
   PasteShortcut,
-  PermissionStatus,
-  WindowsImeStatus,
 } from '../lib/types';
 import { emitSaved } from '../lib/savedEvent';
 import { useHotkeySettings } from '../state/HotkeySettingsContext';
-import i18n, {
-  FOLLOW_SYSTEM,
-  getLocalePreference,
-  outputPrefsForLocale,
-  setLocalePreference,
-  type SupportedLocale,
-} from '../i18n';
-import { Btn, Card, PageHeader, Pill } from './_atoms';
+import { SelectLite } from '../components/ui/SelectLite';
+import { Btn, Card, Collapsible, PageHeader, Pill } from './_atoms';
 import {
   deleteLocalAsrModel,
   getLocalAsrSettings,
@@ -71,6 +47,14 @@ import {
   type LocalAsrModelStatus,
   type LocalAsrSettings,
 } from '../lib/localAsr';
+import { SettingRow, Toggle, inputStyle, type AsrPresetId } from './settings/shared';
+import { AdvancedSection } from './settings/AdvancedSection';
+import { ShortcutsSection } from './settings/ShortcutsSection';
+import { PermissionsSection } from './settings/PermissionsSection';
+import { LanguageSection } from './settings/LanguageSection';
+
+export { Toggle } from './settings/shared';
+export { AboutUpdateControl } from './settings/AboutUpdateControl';
 
 /// Settings → ASR 选了 local-qwen3 时触发跳到「模型设置」页 + 关 Settings modal。
 /// FloatingShell 监听同名事件做 setCurrentTab('localAsr') + setSettingsOpen(false)。
@@ -191,7 +175,10 @@ export function Settings({ embedded = false, initialSection = 'recording' }: Set
             display: 'flex',
             flexDirection: 'column',
             gap: 12,
-            ...(embedded ? { minHeight: 0, overflow: 'auto', paddingRight: 4 } : {}),
+            // paddingBottom: 滚到底时让最后一张 Card / Collapsible 的 border + box-shadow
+            // 不被滚动容器底边吃掉。16 跟 var(--ol-shadow-sm) 的扩散距离 + Card chrome 留白
+            // 匹配，视觉上跟顶部 toolbar 的呼吸感对齐。
+            ...(embedded ? { minHeight: 0, overflow: 'auto', paddingRight: 4, paddingBottom: 16 } : {}),
           }}
         >
           {section === 'recording' && <RecordingSection />}
@@ -206,25 +193,6 @@ export function Settings({ embedded = false, initialSection = 'recording' }: Set
   );
 }
 
-interface SettingRowProps {
-  label: string;
-  desc?: string;
-  children: ReactNode;
-  controlWidth?: number | string;
-}
-
-function SettingRow({ label, desc, children, controlWidth }: SettingRowProps) {
-  return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 180px) minmax(0, 1fr)', gap: 16, padding: '14px 0', borderTop: '0.5px solid var(--ol-line-soft)' }}>
-      <div style={{ minWidth: 0 }}>
-        <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--ol-ink)' }}>{label}</div>
-        {desc && <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginTop: 4, lineHeight: 1.5 }}>{desc}</div>}
-      </div>
-      <div style={{ display: 'flex', alignItems: 'flex-start', minWidth: 0, width: controlWidth ?? 'auto' }}>{children}</div>
-    </div>
-  );
-}
-
 function RecordingSection() {
   const { t } = useTranslation();
   const { prefs, capability, updatePrefs: savePrefs } = useHotkeySettings();
@@ -232,6 +200,24 @@ function RecordingSection() {
   const [microphoneDevicesLoaded, setMicrophoneDevicesLoaded] = useState(false);
   const [microphoneDevicesError, setMicrophoneDevicesError] = useState<string | null>(null);
   const [microphonePickerOpen, setMicrophonePickerOpen] = useState(false);
+  // Wayland 下 rdev 监听不可用（issue #420）。改用 pull 模型：mount 时 invoke 拉状态。
+  // 不能依赖一次性 event — Settings 模态是按需 mount，emit 早在 setup 阶段发完了。
+  // XDG_SESSION_TYPE 在进程生命周期内不会变，拉一次即可，无需 polling 或 listener。
+  const [waylandCliMode, setWaylandCliMode] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void isWaylandCliMode()
+      .then(value => {
+        if (!cancelled) setWaylandCliMode(value);
+      })
+      .catch((err: unknown) => {
+        console.warn('[settings] is_wayland_cli_mode query failed', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadMicrophoneDevices = useCallback(async (
     signal?: { cancelled: boolean },
@@ -350,6 +336,7 @@ function RecordingSection() {
     : t('settings.recording.microphoneDefault');
 
   return (
+    <>
     <Card>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{t('settings.recording.title')}</div>
       <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 6 }}>{t('settings.recording.desc')}</div>
@@ -372,6 +359,7 @@ function RecordingSection() {
           </div>
         </div>
       )}
+      {waylandCliMode && <WaylandHotkeyCallout />}
       <SettingRow label={t('settings.recording.hotkeyLabel')} desc={hotkeyDesc}>
         <ShortcutRecorder
           value={prefs.dictationHotkey}
@@ -472,6 +460,10 @@ function RecordingSection() {
       >
         <Toggle on={prefs.muteDuringRecording} onToggle={onMuteDuringRecordingChange} />
       </SettingRow>
+    </Card>
+
+    {/* ─── 插入与剪贴板（折叠） ──────────────────────────────────── */}
+    <Collapsible title={t('settings.recording.insertGroupTitle')}>
       <SettingRow
         label={t('settings.recording.restoreClipboardLabel')}
         desc={t('settings.recording.restoreClipboardDesc')}
@@ -483,15 +475,17 @@ function RecordingSection() {
           label={t('settings.recording.pasteShortcutLabel')}
           desc={t('settings.recording.pasteShortcutDesc')}
         >
-          <select
+          <SelectLite
             value={prefs.pasteShortcut}
-            onChange={e => onPasteShortcutChange(e.target.value as PasteShortcut)}
+            onChange={next => onPasteShortcutChange(next as PasteShortcut)}
+            options={[
+              { value: 'ctrlV', label: t('settings.recording.pasteShortcutCtrlV') },
+              { value: 'ctrlShiftV', label: t('settings.recording.pasteShortcutCtrlShiftV') },
+              { value: 'shiftInsert', label: t('settings.recording.pasteShortcutShiftInsert') },
+            ]}
+            ariaLabel={t('settings.recording.pasteShortcutLabel')}
             style={{ ...inputStyle, maxWidth: 220 }}
-          >
-            <option value="ctrlV">{t('settings.recording.pasteShortcutCtrlV')}</option>
-            <option value="ctrlShiftV">{t('settings.recording.pasteShortcutCtrlShiftV')}</option>
-            <option value="shiftInsert">{t('settings.recording.pasteShortcutShiftInsert')}</option>
-          </select>
+          />
         </SettingRow>
       )}
       {capability.adapter === 'windowsLowLevel' && (
@@ -505,6 +499,10 @@ function RecordingSection() {
           />
         </SettingRow>
       )}
+    </Collapsible>
+
+    {/* ─── 历史与上下文（折叠） ────────────────────────────────── */}
+    <Collapsible title={t('settings.recording.historyGroupTitle')}>
       <SettingRow
         label={t('settings.recording.historyRetentionLabel')}
         desc={t('settings.recording.historyRetentionDesc')}
@@ -531,6 +529,10 @@ function RecordingSection() {
           style={{ ...inputStyle, width: 80, textAlign: 'right' }}
         />
       </SettingRow>
+    </Collapsible>
+
+    {/* ─── 启动（折叠） ──────────────────────────────────────────── */}
+    <Collapsible title={t('settings.recording.startupGroupTitle')}>
       <AutostartRow />
       <SettingRow
         label={t('settings.recording.startMinimizedLabel')}
@@ -543,7 +545,130 @@ function RecordingSection() {
           {capability.statusHint}
         </div>
       )}
-    </Card>
+    </Collapsible>
+    </>
+  );
+}
+
+/// Wayland 引导 callout：告诉用户绑桌面环境快捷键到 `openless --toggle-dictation`。
+/// 显示条件由父组件控制（mount 时 invoke `is_wayland_cli_mode` 拉状态后渲染）。
+/// 文案逐桌面环境列出步骤，每段 ≤ 5 行，详细的命令在 README 里。
+function WaylandHotkeyCallout() {
+  const { t } = useTranslation();
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const command = 'openless --toggle-dictation';
+
+  const onCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied(true);
+      // 1.5s 后还原按钮文案。用户可重复点击；状态机简单到不必上 useRef cleanup。
+      setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      console.warn('[wayland-callout] clipboard write failed', err);
+    }
+  }, []);
+
+  const helpEntries: Array<readonly [string, string]> = [
+    [t('settings.recording.wayland.gnomeTitle'), t('settings.recording.wayland.gnomeSteps')],
+    [t('settings.recording.wayland.kdeTitle'), t('settings.recording.wayland.kdeSteps')],
+    [t('settings.recording.wayland.hyprlandTitle'), t('settings.recording.wayland.hyprlandSteps')],
+    [t('settings.recording.wayland.swayTitle'), t('settings.recording.wayland.swaySteps')],
+  ];
+
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        marginBottom: 8,
+        padding: '12px 14px',
+        borderRadius: 10,
+        background: 'rgba(217,119,6,0.08)',
+        border: '0.5px solid rgba(217,119,6,0.22)',
+      }}
+    >
+      <div style={{ fontSize: 12.5, fontWeight: 600, color: '#b45309', marginBottom: 4 }}>
+        {t('settings.recording.wayland.calloutTitle')}
+      </div>
+      <div style={{ fontSize: 11.5, color: 'var(--ol-ink-3)', lineHeight: 1.55, marginBottom: 8 }}>
+        {t('settings.recording.wayland.calloutBody')}
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: '8px 10px',
+          borderRadius: 8,
+          background: 'rgba(255,255,255,0.7)',
+          border: '0.5px solid rgba(0,0,0,0.08)',
+          marginBottom: 8,
+        }}
+      >
+        <code
+          style={{
+            flex: 1,
+            fontSize: 12,
+            fontFamily: 'ui-monospace, SF Mono, Menlo, Consolas, monospace',
+            color: 'var(--ol-ink)',
+            userSelect: 'all',
+          }}
+        >
+          {command}
+        </code>
+        <button
+          type="button"
+          onClick={onCopy}
+          style={{
+            padding: '4px 10px',
+            fontSize: 11,
+            fontWeight: 500,
+            border: '0.5px solid rgba(0,0,0,0.12)',
+            borderRadius: 6,
+            background: '#fff',
+            color: 'var(--ol-ink-2)',
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+          }}
+        >
+          {copied
+            ? t('settings.recording.wayland.copyButtonCopied')
+            : t('settings.recording.wayland.copyButton')}
+        </button>
+      </div>
+      <button
+        type="button"
+        onClick={() => setHelpOpen(prev => !prev)}
+        style={{
+          padding: 0,
+          background: 'transparent',
+          border: 0,
+          color: '#b45309',
+          fontSize: 11.5,
+          fontWeight: 500,
+          cursor: 'pointer',
+          fontFamily: 'inherit',
+        }}
+      >
+        {helpOpen ? '▾ ' : '▸ '}
+        {t('settings.recording.wayland.helpToggle')}
+      </button>
+      {helpOpen && (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {helpEntries.map(([title, body]) => (
+            <div key={title}>
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--ol-ink-2)', marginBottom: 2 }}>
+                {title}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--ol-ink-3)', lineHeight: 1.55 }}>
+                {body}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1117,28 +1242,6 @@ function AutostartRow() {
   );
 }
 
-export function Toggle({ on, onToggle }: { on: boolean; onToggle?: (next: boolean) => void }) {
-  return (
-    <button
-      onClick={() => onToggle?.(!on)}
-      style={{
-        position: 'relative', width: 32, height: 18, borderRadius: 999, border: 0,
-        background: on ? 'var(--ol-blue)' : 'rgba(0,0,0,0.15)',
-        cursor: 'default',
-        transition: 'background 0.16s var(--ol-motion-quick)',
-      }}
-    >
-      <span
-        style={{
-          position: 'absolute', top: 2, left: on ? 16 : 2,
-          width: 14, height: 14, borderRadius: 999, background: '#fff',
-          boxShadow: '0 1px 2px rgba(0,0,0,.25)', transition: 'left .16s var(--ol-motion-spring)',
-        }}
-      />
-    </button>
-  );
-}
-
 function LlmThinkingToggle({ enabled, onToggle }: { enabled: boolean; onToggle: (next: boolean) => void }) {
   const { t } = useTranslation();
   return (
@@ -1254,7 +1357,8 @@ const ASR_DEFAULT_RESOURCE_ID = 'volc.bigasr.sauc.duration';
 //   1. 在这里加一项 `{ id, nameKey, baseUrl, model }`；
 //   2. `coordinator.rs::is_whisper_compatible_provider` 加同名 id；
 //   3. 在 i18n 的 `settings.providers.presets.<nameKey>` 加文案。
-const ASR_PRESETS = [
+// `AsrPresetId` 定义在 settings/shared.ts，AdvancedSection / ProvidersSection 共用同一份。
+const ASR_PRESETS: ReadonlyArray<{ id: AsrPresetId; nameKey: string; baseUrl: string; model: string }> = [
   { id: 'volcengine',   nameKey: 'asrVolcengine',   baseUrl: '',                                              model: ''                              },
   { id: 'bailian',      nameKey: 'asrBailian',     baseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/inference/', model: 'fun-asr-realtime'             },
   { id: 'siliconflow',  nameKey: 'asrSiliconflow',  baseUrl: 'https://api.siliconflow.cn/v1',                  model: 'FunAudioLLM/SenseVoiceSmall' },
@@ -1264,9 +1368,7 @@ const ASR_PRESETS = [
   { id: 'foundry-local-whisper', nameKey: 'asrFoundryLocalWhisper', baseUrl: '',                              model: ''                              },
   // 本地 Qwen3-ASR：无 baseUrl/model 配置，模型在「模型设置」页下载与切换。
   { id: 'local-qwen3',  nameKey: 'asrLocalQwen3',   baseUrl: '',                                              model: ''                              },
-] as const;
-
-type AsrPresetId = typeof ASR_PRESETS[number]['id'];
+];
 
 function ProvidersSection() {
   const { t } = useTranslation();
@@ -1429,15 +1531,16 @@ function ProvidersSection() {
         {/* desc 已去掉——'选择后将自动填入 Base URL 默认值' 在 180px label 列必换行成两行，
             视觉上 label 区出现"字体单独占一行"。下拉自身已经表达了"切换"含义，desc 冗余。 */}
         <SettingRow label={t('settings.providers.providerLabel')}>
-          <select
+          <SelectLite
             value={llmProvider}
-            onChange={e => onLlmProviderChange(e.target.value as LlmPresetId)}
+            onChange={next => onLlmProviderChange(next as LlmPresetId)}
+            options={LLM_PRESETS.map(p => ({
+              value: p.id,
+              label: t(`settings.providers.presets.${p.nameKey}`),
+            }))}
+            ariaLabel={t('settings.providers.providerLabel')}
             style={{ ...inputStyle, maxWidth: 200 }}
-          >
-            {LLM_PRESETS.map(p => (
-              <option key={p.id} value={p.id}>{t(`settings.providers.presets.${p.nameKey}`)}</option>
-            ))}
-          </select>
+          />
         </SettingRow>
         {codexOAuthSelected ? (
           <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.6, margin: '2px 0 10px' }}>
@@ -1467,30 +1570,20 @@ function ProvidersSection() {
           <div style={{ fontSize: 13, fontWeight: 600 }}>{t('settings.providers.asrTitle')}</div>
           <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginTop: 2 }}>{t('settings.providers.asrDesc')}</div>
         </div>
-        {/* desc 同 LLM 行去掉，避免 180px label 列里换行。 */}
+        {/* 下拉只放云端选项；本地引擎激活时锁住 + 在下方放一行"ASR 提供商已被接管"提示，
+            未激活时不显示提示。 */}
         <SettingRow label={t('settings.providers.providerLabel')}>
           {(() => {
-            // 平台本机引擎：macOS=Qwen3，Windows=Foundry。本机项始终在下拉里露出，
-            // 当用户未启用本地推理时呈 disabled——用户能看到"它存在 + 提示"，
-            // 但只能在 Advanced 启用；启用后整下拉锁住，**实际激活的** local 项被选中
-            // （pr_agent #403 fix：跨机器同步导致 macOS profile = foundry / Windows
-            // profile = qwen3 时，UI 不能假装是平台本机引擎而要忠实显示）。
-            const platformLocalAsr: AsrPresetId | null =
-              os === 'mac' ? 'local-qwen3' : os === 'win' ? 'foundry-local-whisper' : null;
-            const platformLocalNameKey = platformLocalAsr === 'local-qwen3'
-              ? 'asrLocalQwen3'
-              : platformLocalAsr === 'foundry-local-whisper'
-                ? 'asrFoundryLocalWhisper'
-                : null;
-            const isLocked = committedAsrProvider === 'local-qwen3' || committedAsrProvider === 'foundry-local-whisper';
-            // active 是本地时，selectedValue = 实际 committed 的 provider（不强制
-            // 覆盖成 platformLocalAsr）；非 active 时按 asrProvider（云端选项）显示。
+            const isLocked =
+              committedAsrProvider === 'local-qwen3' ||
+              committedAsrProvider === 'foundry-local-whisper';
             const selectedValue: AsrPresetId = isLocked ? committedAsrProvider : asrProvider;
-            // 异常 local：当前激活的 local 不是本平台本机引擎（跨机器配置同步）。
-            // 必须把它也作为 disabled <option> 加进列表，否则受控 <select> 会回退
-            // 到第一项造成视觉假象。
+            // 跨机器同步异常兜底：committed 是本地但不在 visibleAsrPresets 里时，受控
+            // select 会回退到首项造成假象 —— 补一个 disabled option 让 select 找到当前值。
             const anomalousLocal: AsrPresetId | null =
-              isLocked && committedAsrProvider !== platformLocalAsr ? committedAsrProvider : null;
+              isLocked && !visibleAsrPresets.some(p => p.id === committedAsrProvider)
+                ? committedAsrProvider
+                : null;
             const anomalousNameKey = anomalousLocal === 'local-qwen3'
               ? 'asrLocalQwen3'
               : anomalousLocal === 'foundry-local-whisper'
@@ -1498,35 +1591,29 @@ function ProvidersSection() {
                 : null;
             return (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start', minWidth: 0 }}>
-                <select
+                <SelectLite
                   value={selectedValue}
                   disabled={isLocked}
-                  onChange={e => onAsrProviderChange(e.target.value as AsrPresetId)}
-                  style={{
-                    ...inputStyle,
-                    maxWidth: 200,
-                    ...(isLocked ? { opacity: 0.65, cursor: 'not-allowed' } : {}),
-                  }}
-                >
-                  {visibleAsrPresets.map(p => (
-                    <option key={p.id} value={p.id}>{t(`settings.providers.presets.${p.nameKey}`)}</option>
-                  ))}
-                  {platformLocalAsr && platformLocalNameKey && (
-                    <option key={platformLocalAsr} value={platformLocalAsr} disabled>
-                      {t(`settings.providers.presets.${platformLocalNameKey}`)}
-                    </option>
-                  )}
-                  {anomalousLocal && anomalousNameKey && (
-                    <option key={anomalousLocal} value={anomalousLocal} disabled>
-                      {t(`settings.providers.presets.${anomalousNameKey}`)}
-                    </option>
-                  )}
-                </select>
-                {platformLocalAsr && platformLocalNameKey && (
-                  <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', lineHeight: 1.5, maxWidth: 320 }}>
-                    {t('settings.providers.localAsrTakeoverHint', {
-                      name: t(`settings.providers.presets.${platformLocalNameKey}`),
-                    })}
+                  onChange={next => onAsrProviderChange(next as AsrPresetId)}
+                  options={[
+                    ...visibleAsrPresets.map(p => ({
+                      value: p.id,
+                      label: t(`settings.providers.presets.${p.nameKey}`),
+                    })),
+                    ...(anomalousLocal && anomalousNameKey
+                      ? [{
+                          value: anomalousLocal,
+                          label: t(`settings.providers.presets.${anomalousNameKey}`),
+                          disabled: true,
+                        }]
+                      : []),
+                  ]}
+                  ariaLabel={t('settings.providers.providerLabel')}
+                  style={{ ...inputStyle, maxWidth: 200 }}
+                />
+                {isLocked && (
+                  <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', lineHeight: 1.5 }}>
+                    {t('settings.providers.asrProviderTakenOver')}
                   </div>
                 )}
               </div>
@@ -1594,212 +1681,6 @@ function ProvidersSection() {
   );
 }
 
-/// 「高级」标签页——本地推理 / 实验性开关都集中在这里。
-///
-/// 设计：
-/// - 主 Providers 下拉只列云端选项；本地推理 (local-qwen3 / foundry-local-whisper)
-///   完全收纳到此栏，新手不会在主流程里误开 CPU 推理。
-/// - 启用本地推理时弹出**屏幕中央**的 modal（背景模糊）——一个框、一段短话、确认/取消。
-/// - 旧的「模型设置」独立页 (LocalAsr.tsx 作为 nav tab) 已下线，模型管理 UI
-///   通过 <LocalAsr embedded /> 内嵌在此处统一管理。
-///
-/// 平台对称（每端只露本机有后端的引擎，另一端的引擎以 disabled 行 + "本平台暂不支持"提示露出）：
-/// - macOS:   Qwen3-ASR 主行可启用；Foundry **不显示**（macOS 不展示 Windows 端模型内容）。
-/// - Windows: Foundry 主行可启用；Qwen3 行 disabled，desc 为 notSupportedHere。
-/// - Linux:   「该平台暂未支持本地 ASR 模型集成」整段兜底。
-function AdvancedSection() {
-  const { t } = useTranslation();
-  const { prefs, updatePrefs } = useHotkeySettings();
-  const os = detectOS();
-  const isMac = os === 'mac';
-  const isWin = os === 'win';
-  const platformSupported = isMac || isWin;
-  const switchSeqRef = useRef(0);
-  const [busy, setBusy] = useState(false);
-  // 待确认的启用目标。!== null 时中央 modal 弹出 + 背景模糊；用户点确认 → 真切；
-  // 点取消 → 回到 null。一次只允许一个 modal。
-  const [pendingTarget, setPendingTarget] = useState<AsrPresetId | null>(null);
-
-  const activeAsrProvider = (prefs?.activeAsrProvider ?? 'volcengine') as AsrPresetId;
-  const isOnLocalQwen3 = activeAsrProvider === 'local-qwen3';
-  const isOnFoundry = activeAsrProvider === 'foundry-local-whisper';
-  const isOnAnyLocal = isOnLocalQwen3 || isOnFoundry;
-
-  const requestEnable = (target: AsrPresetId) => {
-    setPendingTarget(target);
-  };
-
-  const performSwitch = async (target: AsrPresetId) => {
-    setBusy(true);
-    const seq = ++switchSeqRef.current;
-    try {
-      await setActiveAsrProvider(target);
-      if (seq !== switchSeqRef.current) return;
-      if (prefs) {
-        await updatePrefs({ ...prefs, activeAsrProvider: target });
-      }
-    } finally {
-      if (seq === switchSeqRef.current) {
-        setBusy(false);
-        setPendingTarget(null);
-      }
-    }
-  };
-
-  const pendingNameKey =
-    pendingTarget === 'local-qwen3' ? 'asrLocalQwen3'
-    : pendingTarget === 'foundry-local-whisper' ? 'asrFoundryLocalWhisper'
-    : null;
-
-  return (
-    <>
-      {/* ─── 屏幕中央确认 modal（背景模糊） ─────────────────────────────
-          点击遮罩或取消按钮关闭；切换中（busy）禁止任何关闭路径以免半切失败。 */}
-      {pendingTarget && pendingNameKey && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0, 0, 0, 0.32)',
-            backdropFilter: 'blur(8px)',
-            WebkitBackdropFilter: 'blur(8px)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-            padding: 16,
-          }}
-          onClick={(e) => {
-            if (e.target === e.currentTarget && !busy) setPendingTarget(null);
-          }}>
-          <Card
-            style={{
-              background: 'rgba(255, 188, 60, 0.12)',
-              border: '1px solid rgba(220, 110, 0, 0.55)',
-              maxWidth: 360,
-              width: '100%',
-            }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: '#A04500', marginBottom: 6 }}>
-              ⚠️ {t('settings.advanced.confirmEnableLocalTitle')}
-            </div>
-            <div style={{ fontSize: 12.5, color: 'var(--ol-ink-2)', lineHeight: 1.6, marginBottom: 10 }}>
-              {t('settings.advanced.confirmEnableLocalBody', {
-                target: t(`settings.providers.presets.${pendingNameKey}`),
-              })}
-            </div>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Btn variant="ghost" size="sm" disabled={busy} onClick={() => setPendingTarget(null)}>
-                {t('common.cancel')}
-              </Btn>
-              <Btn
-                variant="primary"
-                size="sm"
-                disabled={busy}
-                onClick={() => void performSwitch(pendingTarget)}>
-                {t('settings.advanced.confirm')}
-              </Btn>
-            </div>
-          </Card>
-        </div>
-      )}
-
-      <Card>
-        {/* 标题 + 右上角 inline 警告小字（替换原琥珀大警告条）。 */}
-        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, marginBottom: 14 }}>
-          <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 13, fontWeight: 600 }}>{t('settings.advanced.localAsrTitle')}</div>
-            <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginTop: 2 }}>
-              {t('settings.advanced.localAsrDesc')}
-            </div>
-          </div>
-          <div style={{
-            fontSize: 11,
-            color: '#A04500',
-            fontWeight: 500,
-            lineHeight: 1.4,
-            textAlign: 'right',
-            flexShrink: 0,
-            maxWidth: '52%',
-            paddingTop: 2,
-          }}>
-            ⚠️ {t('settings.advanced.localAsrWarningShort')}
-          </div>
-        </div>
-
-        {!platformSupported ? (
-          <div style={{ fontSize: 12.5, color: 'var(--ol-ink-3)', lineHeight: 1.6, padding: '8px 0' }}>
-            {t('settings.advanced.platformNotSupported')}
-          </div>
-        ) : (
-          <>
-            {/* Qwen3 行 —— macOS Toggle 可点切换；Windows 后端是 stub，Toggle 始终 off
-                + 不可点 + desc=notSupportedHere，跟"本平台不可用"视觉一致。跨平台
-                异常（Windows profile 同步到 local-qwen3）时 active 状态靠下方独立
-                "禁用本地 ASR" 行兜底，避免 Toggle ON + desc 说不支持的自相矛盾感
-                （pr_agent #403 'Stale Windows state' 修法）。 */}
-            <SettingRow
-              label={t('settings.providers.presets.asrLocalQwen3')}
-              desc={isMac ? t('settings.advanced.qwen3Desc') : t('settings.advanced.notSupportedHere')}>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
-                <Toggle
-                  on={isMac && isOnLocalQwen3}
-                  onToggle={isMac && !busy && pendingTarget === null ? (next) => {
-                    if (next) requestEnable('local-qwen3');
-                    else void performSwitch('volcengine');
-                  } : undefined}
-                />
-              </div>
-            </SettingRow>
-
-            {/* Foundry 行 —— 仅 Windows 露出（macOS 不展示 Windows 端模型内容）。 */}
-            {isWin && (
-              <SettingRow
-                label={t('settings.providers.presets.asrFoundryLocalWhisper')}
-                desc={t('settings.advanced.foundryDesc')}>
-                <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
-                  <Toggle
-                    on={isOnFoundry}
-                    onToggle={!busy && pendingTarget === null ? (next) => {
-                      if (next) requestEnable('foundry-local-whisper');
-                      else void performSwitch('volcengine');
-                    } : undefined}
-                  />
-                </div>
-              </SettingRow>
-            )}
-          </>
-        )}
-
-        {/* 「禁用本地 ASR」逃生入口——只在行内 Toggle 关不掉的场景露出：
-            - Linux / 不支持平台：根本没有任何引擎行
-            - 跨平台异常（macOS profile 同步到 foundry / Windows profile 同步到 qwen3）：
-              本机引擎 Toggle 是 off，关不动异常 active 的对方引擎
-            否则平台本机 Toggle 自身就能 off → 关停，重复 disable 行徒增视觉。 */}
-        {isOnAnyLocal && !((isMac && isOnLocalQwen3) || (isWin && isOnFoundry)) && (
-          <SettingRow
-            label={t('settings.advanced.disableLocalLabel')}
-            desc={t('settings.advanced.disableLocalDesc')}>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
-              <Btn
-                variant="primary"
-                size="sm"
-                disabled={busy || pendingTarget !== null}
-                onClick={() => void performSwitch('volcengine')}>
-                {t('settings.advanced.disable')}
-              </Btn>
-            </div>
-          </SettingRow>
-        )}
-      </Card>
-
-      {/* 模型管理 UI（镜像源 / 模型列表 / 下载 / 删除 / 设为默认 / Foundry Local）
-          inline 渲染——「模型设置」独立页已删，这里是唯一入口。 */}
-      {platformSupported && <LocalAsr embedded />}
-    </>
-  );
-}
 
 type ProviderToolStatus = 'idle' | 'loading' | 'success' | 'empty' | 'error';
 
@@ -1872,15 +1753,15 @@ function ProviderTools({ kind, modelAccount, onModelSelected }: { kind: 'llm' | 
           <button onClick={validate} style={miniBtnStyle} disabled={status === 'loading'}>{t('settings.providers.validate')}</button>
           <button onClick={loadModels} style={miniBtnStyle} disabled={status === 'loading'}>{t('settings.providers.fetchModels')}</button>
           {models.length > 0 && (
-            <select
+            <SelectLite
               value={selectedModel}
-              onChange={e => applyModel(e.target.value)}
+              onChange={applyModel}
               disabled={status === 'loading'}
+              options={models.map(model => ({ value: model, label: model }))}
+              placeholder={t('settings.providers.selectModel')}
+              ariaLabel={t('settings.providers.selectModel')}
               style={{ ...inputStyle, maxWidth: 220 }}
-            >
-              <option value="" disabled>{t('settings.providers.selectModel')}</option>
-              {models.map(model => <option key={model} value={model}>{model}</option>)}
-            </select>
+            />
           )}
         </div>
         {message && (
@@ -2100,15 +1981,6 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
   );
 }
 
-const inputStyle: CSSProperties = {
-  flex: 1, height: 32, padding: '0 10px',
-  border: '0.5px solid var(--ol-line-strong)',
-  borderRadius: 8, fontSize: 12.5,
-  fontFamily: 'inherit', outline: 'none',
-  background: 'var(--ol-surface-2)',
-  width: '100%', maxWidth: 360,
-  transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick)',
-};
 const miniBtnStyle: CSSProperties = {
   height: 32, padding: '0 10px',
   border: '0.5px solid var(--ol-line-strong)',
@@ -2200,372 +2072,10 @@ const iconBtnStyle: CSSProperties = {
   transition: 'background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick)',
 };
 
-function ShortcutsSection() {
-  const { t } = useTranslation();
-  const { prefs, hotkey, capability, updatePrefs: savePrefs } = useHotkeySettings();
 
-  if (!prefs || !hotkey || !capability) {
-    return (
-      <Card>
-        <div style={{ fontSize: 12, color: 'var(--ol-ink-4)' }}>{t('common.loading')}</div>
-      </Card>
-    );
-  }
 
-  const desc = capability.requiresAccessibilityPermission
-    ? t('settings.shortcuts.descAcc')
-    : t('settings.shortcuts.descNoAcc');
-  const readonlyRows: Array<[string, string]> = [
-    [t('settings.shortcuts.cancel'), 'Esc'],
-    [t('settings.shortcuts.confirm'), t('settings.shortcuts.confirmHint')],
-  ];
-  return (
-    <Card>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{t('settings.shortcuts.title')}</div>
-      <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 6 }}>{desc}</div>
-      <SettingRow label={t('settings.shortcuts.startStop')}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%' }}>
-          <ShortcutRecorder
-            value={prefs.dictationHotkey}
-            alignRecordButton
-            onSave={async binding => {
-              await setDictationHotkey(binding);
-              await savePrefs({ ...prefs, dictationHotkey: binding });
-            }}
-          />
-          <div style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>
-            {hotkey.mode === 'hold' ? t('hotkey.modeHoldSuffix') : t('hotkey.modeToggleSuffix')}
-          </div>
-        </div>
-      </SettingRow>
-      <SettingRow label={t('translation.hotkey.title', 'Translation shortcut')}>
-        <ShortcutRecorder
-          value={prefs.translationHotkey}
-          alignRecordButton
-          onSave={async binding => {
-            await setTranslationHotkey(binding);
-            await savePrefs({ ...prefs, translationHotkey: binding });
-          }}
-        />
-      </SettingRow>
-      <SettingRow label={t('selectionAsk.hotkey.title')}>
-        {prefs.qaHotkey ? (
-          <ShortcutRecorder
-            value={prefs.qaHotkey}
-            alignRecordButton
-            onSave={async binding => {
-              await setQaHotkey(binding);
-              await savePrefs({ ...prefs, qaHotkey: binding });
-            }}
-          />
-        ) : (
-          <button
-            onClick={async () => {
-              const binding = defaultQaShortcut();
-              await setQaHotkey(binding);
-              await savePrefs({ ...prefs, qaHotkey: binding });
-            }}
-            style={{ fontSize: 12, padding: '5px 14px', background: 'var(--ol-blue)', color: '#fff', border: 0, borderRadius: 6, fontFamily: 'inherit', fontWeight: 500, cursor: 'default' }}
-          >
-            {t('selectionAsk.hotkey.enable', 'Enable')}
-          </button>
-        )}
-      </SettingRow>
-      <SettingRow label={t('settings.shortcuts.switchStyle')}>
-        <ShortcutRecorder
-          value={prefs.switchStyleHotkey}
-          alignRecordButton
-          onSave={async binding => {
-            await setSwitchStyleHotkey(binding);
-            await savePrefs({ ...prefs, switchStyleHotkey: binding });
-          }}
-        />
-      </SettingRow>
-      <SettingRow label={t('settings.shortcuts.openApp')}>
-        <ShortcutRecorder
-          value={prefs.openAppHotkey}
-          alignRecordButton
-          onSave={async binding => {
-            await setOpenAppHotkey(binding);
-            await savePrefs({ ...prefs, openAppHotkey: binding });
-          }}
-        />
-      </SettingRow>
-      {readonlyRows.map(([k, v]) => (
-        <SettingRow key={k} label={k}>
-          <kbd style={{
-            display: 'inline-flex', alignItems: 'center', gap: 4,
-            padding: '4px 10px', fontSize: 12, fontFamily: 'var(--ol-font-mono)',
-            borderRadius: 6, background: 'var(--ol-surface-2)',
-            border: '0.5px solid var(--ol-line-strong)',
-            boxShadow: '0 1px 0 rgba(0,0,0,0.04)',
-            color: 'var(--ol-ink-2)',
-          }}>{v}</kbd>
-        </SettingRow>
-      ))}
-    </Card>
-  );
-}
 
-function PermissionsSection() {
-  const { t } = useTranslation();
-  const [accessibility, setAccessibility] = useState<PermissionStatus | 'loading'>('loading');
-  const [microphone, setMicrophone] = useState<PermissionStatus | 'loading'>('loading');
-  const [hotkey, setHotkey] = useState<HotkeyStatus | null>(null);
-  const [windowsIme, setWindowsIme] = useState<WindowsImeStatus | null>(null);
-  const { capability } = useHotkeySettings();
 
-  const refreshPermissions = async () => {
-    const [a, m] = await Promise.all([
-      checkAccessibilityPermission(),
-      checkMicrophonePermission(),
-    ]);
-    setAccessibility(a);
-    setMicrophone(m);
-  };
-
-  const refreshHotkey = async () => {
-    setHotkey(await getHotkeyStatus());
-  };
-
-  const refreshWindowsIme = async () => {
-    setWindowsIme(await getWindowsImeStatus());
-  };
-
-  useEffect(() => {
-    refreshPermissions();
-    refreshHotkey();
-    refreshWindowsIme();
-    const hotkeyId = window.setInterval(refreshHotkey, 1000);
-    // 麦克风检查会短暂打开输入流，避免每秒探测导致隐私指示器频繁闪烁。
-    const permissionId = window.setInterval(refreshPermissions, 10000);
-    const onFocus = () => {
-      refreshPermissions();
-      refreshHotkey();
-      refreshWindowsIme();
-    };
-    window.addEventListener('focus', onFocus);
-    return () => {
-      window.clearInterval(hotkeyId);
-      window.clearInterval(permissionId);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, []);
-
-  const reRequestAccessibility = async () => {
-    await requestAccessibilityPermission();
-    refreshPermissions();
-  };
-
-  const reRequestMicrophone = async () => {
-    if (microphone === 'denied' || microphone === 'restricted') {
-      await openSystemSettings('microphone');
-      refreshPermissions();
-      return;
-    }
-    const status = await requestMicrophonePermission();
-    setMicrophone(status);
-    if (status === 'denied' || status === 'restricted') {
-      await openSystemSettings('microphone');
-    }
-    refreshPermissions();
-  };
-
-  const desc = capability?.requiresAccessibilityPermission
-    ? t('settings.permissions.descAcc')
-    : t('settings.permissions.descNoAcc');
-
-  return (
-    <Card>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{t('settings.permissions.title')}</div>
-      <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 6 }}>
-        {desc}
-      </div>
-      <SettingRow label={t('settings.permissions.micLabel')} desc={t('settings.permissions.micDesc')}>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'flex-end', width: '100%' }}>
-          <PermissionPill status={microphone} />
-          {microphone !== 'granted' && microphone !== 'notApplicable' && microphone !== 'loading' && (
-            <Btn variant="ghost" size="sm" onClick={reRequestMicrophone}>
-              {microphone === 'denied' || microphone === 'restricted' ? t('settings.permissions.openSystem') : t('settings.permissions.grant')}
-            </Btn>
-          )}
-        </div>
-      </SettingRow>
-      {capability?.requiresAccessibilityPermission && (
-        <SettingRow label={t('settings.permissions.accLabel')} desc={t('settings.permissions.accDesc')}>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <PermissionPill status={accessibility} />
-            {accessibility !== 'granted' && accessibility !== 'notApplicable' && (
-              <Btn variant="ghost" size="sm" onClick={reRequestAccessibility}>
-                {t('settings.permissions.grant')}
-              </Btn>
-            )}
-          </div>
-        </SettingRow>
-      )}
-      <SettingRow
-        label={t('settings.permissions.hotkeyLabel')}
-        desc={capability ? t('settings.permissions.hotkeyDescWithAdapter', { adapter: adapterDisplayName(capability.adapter) }) : t('settings.permissions.hotkeyDescPlain')}
-      >
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', width: '100%' }}>
-          {hotkey?.message && (
-            <span style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {hotkey.message}
-            </span>
-          )}
-          <HotkeyStatusPill status={hotkey} />
-        </div>
-      </SettingRow>
-      {windowsIme?.state !== 'notWindows' && (
-        <SettingRow
-          label={t('settings.permissions.windowsImeLabel')}
-          desc={t('settings.permissions.windowsImeDesc')}
-        >
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center', minWidth: 0, justifyContent: 'flex-end', width: '100%' }}>
-            {windowsIme && (
-              <span style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {t(`settings.permissions.windowsIme.${windowsIme.state}`)}
-              </span>
-            )}
-            <WindowsImeStatusPill status={windowsIme} />
-          </div>
-        </SettingRow>
-      )}
-      <SettingRow label={t('settings.permissions.networkLabel')} desc={t('settings.permissions.networkDesc')}>
-        <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
-          <Pill tone="ok"><Icon name="check" size={11} />{t('settings.permissions.networkOk')}</Pill>
-        </div>
-      </SettingRow>
-    </Card>
-  );
-}
-
-function PermissionPill({ status }: { status: PermissionStatus | 'loading' }) {
-  const { t } = useTranslation();
-  if (status === 'loading') {
-    return <Pill tone="default">{t('settings.permissions.checking')}</Pill>;
-  }
-  if (status === 'granted') {
-    return <Pill tone="ok"><Icon name="check" size={11} />{t('settings.permissions.granted')}</Pill>;
-  }
-  if (status === 'notApplicable') {
-    return <Pill tone="default">{t('settings.permissions.notApplicable')}</Pill>;
-  }
-  if (status === 'denied' || status === 'restricted') {
-    return <Pill tone="outline">{t('settings.permissions.denied')}</Pill>;
-  }
-  return <Pill tone="outline">{t('settings.permissions.indeterminate')}</Pill>;
-}
-
-function LanguageSection() {
-  const { t } = useTranslation();
-  const { updatePrefs } = useHotkeySettings();
-  const [pref, setPref] = useState<SupportedLocale | typeof FOLLOW_SYSTEM>(getLocalePreference());
-
-  const apply = async (next: SupportedLocale | typeof FOLLOW_SYSTEM) => {
-    setPref(next);
-    const resolved = await setLocalePreference(next);
-    const localePrefs = outputPrefsForLocale(resolved);
-    await updatePrefs(current => {
-      if (
-        current.chineseScriptPreference === localePrefs.chineseScriptPreference &&
-        current.outputLanguagePreference === localePrefs.outputLanguagePreference
-      ) {
-        return current;
-      }
-      return { ...current, ...localePrefs };
-    });
-  };
-
-  return (
-    <Card>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4 }}>{t('settings.language.title')}</div>
-      <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginBottom: 6 }}>{t('settings.language.desc')}</div>
-      <SettingRow label={t('settings.language.label')} desc={t('settings.language.labelDesc')}>
-        <select
-          value={pref}
-          onChange={e => apply(e.target.value as SupportedLocale | typeof FOLLOW_SYSTEM)}
-          style={{ ...inputStyle, maxWidth: 220 }}
-        >
-          <option value={FOLLOW_SYSTEM}>{t('settings.language.followSystem')}</option>
-          <option value="zh-CN">{t('settings.language.zh')}</option>
-          <option value="zh-TW">{t('settings.language.zhTW')}</option>
-          <option value="en">{t('settings.language.en')}</option>
-          <option value="ja">{t('settings.language.ja')}</option>
-          <option value="ko">{t('settings.language.ko')}</option>
-          <option value="uz">O&apos;zbekcha</option>
-        </select>
-      </SettingRow>
-      <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 8, lineHeight: 1.6 }}>
-        {t('settings.language.restartHint')}
-      </div>
-    </Card>
-  );
-}
-
-// AboutSection 已移除：内容并入 SettingsModal 的 AboutMini，避免设置内外两个"关于"重复入口。
-
-export function AboutUpdateControl({ tagline }: { tagline: string }) {
-  const { t } = useTranslation();
-  const u = useAutoUpdate();
-  return (
-    <>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 2 }}>
-        <span style={{ fontSize: 12, color: 'var(--ol-ink-3)' }}>{tagline} 路 {APP_VERSION_LABEL}</span>
-        <Btn variant="ghost" size="sm" onClick={u.checkForUpdates} disabled={u.checking || u.busy}>
-          {u.checking ? t('settings.about.checkingUpdate') : t('settings.about.checkUpdateBtn')}
-        </Btn>
-      </div>
-      {(u.status === 'none' || u.status === 'error') && (
-        <div style={{ fontSize: 11, color: u.status === 'error' ? 'var(--ol-err)' : 'var(--ol-ink-4)', marginTop: 4 }}>
-          {u.status === 'none' ? t('settings.about.upToDate') : t('settings.about.updateError')}
-        </div>
-      )}
-      {isDialogStatus(u.status) && (
-        <UpdateDialog
-          status={u.status}
-          version={u.version}
-          progress={u.progress}
-          downloaded={u.downloaded}
-          contentLength={u.contentLength}
-          onInstall={u.installUpdate}
-          onClose={u.dismissDialog}
-        />
-      )}
-    </>
-  );
-}
-
-function HotkeyStatusPill({ status }: { status: HotkeyStatus | null }) {
-  const { t } = useTranslation();
-  if (!status) {
-    return <Pill tone="default">{t('settings.permissions.checking')}</Pill>;
-  }
-  if (status.state === 'installed') {
-    return <Pill tone="ok"><Icon name="check" size={11} />{t('settings.permissions.hotkeyInstalled')}</Pill>;
-  }
-  if (status.state === 'starting') {
-    return <Pill tone="default">{t('settings.permissions.hotkeyStarting')}</Pill>;
-  }
-  return <Pill tone="outline">{t('settings.permissions.hotkeyFailed')}</Pill>;
-}
-
-function WindowsImeStatusPill({ status }: { status: WindowsImeStatus | null }) {
-  const { t } = useTranslation();
-  if (!status) {
-    return <Pill tone="default">{t('settings.permissions.checking')}</Pill>;
-  }
-  if (status.state === 'installed') {
-    return <Pill tone="ok"><Icon name="check" size={11} />{t('settings.permissions.windowsImeInstalled')}</Pill>;
-  }
-  return <Pill tone="outline">{t('settings.permissions.windowsImeUnavailable')}</Pill>;
-}
-
-function adapterDisplayName(adapter: HotkeyCapability['adapter'] | HotkeyStatus['adapter']) {
-  if (adapter === 'macEventTap') return i18n.t('hotkey.adapter.macEventTap');
-  if (adapter === 'windowsLowLevel') return i18n.t('hotkey.adapter.windowsLowLevel');
-  return i18n.t('hotkey.adapter.rdev');
-}
 
 /// 本地 Qwen3-ASR 在 Settings → 服务商区里**不**让用户填空——展示当前激活模型
 /// 是否已下载、列出所有已下载模型 + 删除按钮，并提示性能/质量预期，引导跳到

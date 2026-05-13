@@ -175,6 +175,7 @@ export const uz: typeof zhCN = {
     kicker: "LUG'AT",
     title: "Lug'at",
     desc: "Modelga kutilayotgan so'zlarni aytib bering — yangi atamalar, ismlar, jargon. Ular ASR hot so'zlari va model konteksti sifatida uzatiladi.",
+    sectionTitle: 'Atamalar',
     placeholder: "So'z kiriting, Enter bosing yoki Qo'shish tugmasini bosing…",
     tip: "O'zbek/ingliz aralash qo'llab-quvvatlanadi · raqamli prefikslar so'zma-so'z moslashtiriladi · moslashuv soni avtomatik hisoblanadi",
     loadFailed: 'Yuklanmadi: {{err}}',
@@ -367,6 +368,7 @@ export const uz: typeof zhCN = {
       muteDuringRecordingLabel: 'Yozish paytida ovozni o\'chirish',
       muteDuringRecordingDesc:
         "Ovozli kiritish paytida tizim chiqishini vaqtincha o'chiradi, to'xtatilganda, bekor qilinganda yoki xatolikda oldingi holatga qaytaradi.",
+      insertGroupTitle: 'Kiritish va clipboard',
       restoreClipboardLabel: "Kiritishdan so'ng clipboard ni tiklash",
       restoreClipboardDesc:
         "Faqat Windows / Linux: muvaffaqiyatli joylashtirish so'ng asl clipboard mazmunini tiklash (sukut yoqiq). O'chirish diktovka matnini clipboardda saqlaydi, simulyatsiya joylashtiruv aslida bajarilmasa Ctrl+V bilan qaytarib olish uchun. Issue #111 ga qarang.",
@@ -388,12 +390,14 @@ export const uz: typeof zhCN = {
       allowNonTsfFallbackLabel: "TSF bo'lmagan zaxirasiga ruxsat berish",
       allowNonTsfFallbackDesc:
         "Faqat Windows: TSF to'g'ridan-to'g'ri kiritish bajarilmasa, Unicode SendInput, klavish joylashtiruvi yoki WM_PASTE ishlatishga ruxsat berish. O'chirib, kiritish haqiqatan TSF dan kelayotganini tekshirishingiz mumkin.",
+      historyGroupTitle: 'Tarix va kontekst',
       historyRetentionLabel: 'Tarix saqlash muddati (kun)',
       historyRetentionDesc:
         "Bu kundan oshgan tarix yozuvlari yangi yozuv yozilganida tozalanadi. 0 = vaqt bo'yicha tozalash yo'q (hali ham 200 ta cheklov). Sukut 7 kun.",
       polishContextWindowLabel: 'Tahrirlash kontekst oynasi (daqiqa)',
       polishContextWindowDesc:
         "LLM ga so'nggi N daqiqadagi muvaffaqiyatli tahrirlangan transkripsiyalarni ko'p bosqichli kontekst sifatida berish, olmoshlar va tugallanmagan gaplar to'g'ri talqin etilishi uchun. 0 = o'chirilgan (bitta mustaqil tahrirlash). Sukut 5 daqiqa.",
+      startupGroupTitle: 'Ishga tushirish',
       startMinimizedLabel: "Minimallashtirilgan holda boshlash (asosiy oyna yo'q)",
       startMinimizedDesc:
         "Yoqilganda, asosiy oyna hech qachon ishga tushishda ko'rinmaydi (login autostart ham) — OpenLess faqat menyu paneli / tray da ishlaydi. Kerak bo'lganda tray ikonasini bosib asosiy oynani oching.",
@@ -401,6 +405,26 @@ export const uz: typeof zhCN = {
       startupAtBootDesc:
         "Tizimga kirganingizda OpenLess ni avtomatik ishga tushirish. macOS LaunchAgent dan, Linux ~/.config/autostart dan, Windows HKCU\\Run dan foydalanadi (admin talab qilinmaydi). Issue #194 ga qarang.",
       startupAtBootError: 'Tizimga kirishda ishga tushirishni almashtirishda xatolik: {{message}}',
+      wayland: {
+        calloutTitle: 'Wayland ish stoli muhiti aniqlandi',
+        calloutBody:
+          "Wayland xavfsizlik sabablari tufayli ilovalarga global klavishlarni tinglashga ruxsat bermaydi. Iltimos, tizim sozlamalarida quyidagi buyruqqa bog'langan maxsus klavish kombinatsiyasini yarating:",
+        copyButton: 'Nusxalash',
+        copyButtonCopied: 'Nusxalandi',
+        helpToggle: "Har bir ish stoli muhiti uchun sozlash qadamlarini ko'rish",
+        gnomeTitle: 'GNOME',
+        gnomeSteps:
+          "Sozlamalar → Klaviatura → Klavish kombinatsiyalarini ko'rish va sozlash → Maxsus klavishlar → Klavish kombinatsiyasi qo'shish, buyruq maydoniga yuqoridagi buyruqni joylashtiring, so'ng kerakli klavishlarni yozib oling.",
+        kdeTitle: 'KDE Plasma',
+        kdeSteps:
+          "Tizim sozlamalari → Klaviatura → Klavish kombinatsiyalari → Yangi qo'shish → Buyruq/URL, istalgan tetiklovchi klavishni yozib oling, harakat maydoniga yuqoridagi buyruqni qo'ying va saqlang.",
+        hyprlandTitle: 'Hyprland',
+        hyprlandSteps:
+          "~/.config/hypr/hyprland.conf faylini tahrirlang, bind = SUPER, Y, exec, openless --toggle-dictation qatorini qo'shing, so'ng hyprctl reload ni ishga tushiring.",
+        swayTitle: 'sway',
+        swaySteps:
+          "~/.config/sway/config faylini tahrirlang, bindsym $mod+y exec openless --toggle-dictation qatorini qo'shing, so'ng swaymsg reload ni ishga tushiring.",
+      },
     },
     providers: {
       llmTitle: 'LLM (tahrirlash)',
@@ -445,6 +469,7 @@ export const uz: typeof zhCN = {
       localAsrActiveNotice:
         "Mahalliy ASR ({{name}}) hozir faol. Kengaytirilgan bo'limidan almashtiring yoki o'chiring.",
       localAsrTakeoverHint: "«{{name}}» yoqilgach, ASR provayderi egallab olinadi.",
+      asrProviderTakenOver: 'ASR provayderi egallab olindi',
       localAsrHint:
         "Mahalliy Qwen3-ASR to'liq bu qurilmada ishlaydi. API key kerak emas — modelni HuggingFace dan yuklab oling.",
       foundryLocalAsrHint:
@@ -555,6 +580,20 @@ export const uz: typeof zhCN = {
       },
     },
     advanced: {
+      streamingInsertTitle: 'Streaming insert',
+      streamingInsertTitleLinux: 'Streaming insert (eksperimental)',
+      streamingInsertDesc:
+        "Tahrirlash natijasi kelishi bilan harf-harf kursorga tushadi va sezilarli kechikishni kamaytiradi. Shartlar bajarilmasa (OpenAI-mos bo'lmagan LLM, Raw / tarjima rejimi, Secure Input fokus), bir martalik joylashtirishga avtomatik qaytadi.",
+      streamingInsertLabel: 'Streaming insert',
+      streamingInsertHintMac:
+        "Vaqtincha ABC kirish manbasiga o'tadi (CJK IME ushlab qolishining oldini olish uchun) va seans tugagach avtomatik qaytadi.",
+      streamingInsertHintWindows:
+        "SendInput Unicode harflarni to'g'ridan-to'g'ri yuboradi — TSF / IME chetlab o'tiladi, kirish usuli almashtirilmaydi.",
+      streamingInsertHintLinux:
+        "enigo + XTest klavishlarni sintez qiladi. X11 da barqaror; Wayland compositor ga bog'liq, muvaffaqiyatsizlikda avtomatik qaytadi.",
+      streamingInsertSaveClipboardLabel: 'Clipboardga sinxronlash',
+      streamingInsertSaveClipboardHint:
+        "Kiritish muvaffaqiyatli tugagach yakuniy matnni clipboardga yozadi — qayta Cmd+V bilan joylashtirish qulay; o'chirilganda streaming jarayoni clipboardga tegmaydi.",
       localAsrTitle: 'Mahalliy ASR modellari (eksperimental)',
       localAsrDesc:
         "Transkripsiyani bulut ASR dan mahalliy inferansiyaga o'tkazish. Faqat oflayn/maxfiylik uchun tavsiya etiladi.",
@@ -669,7 +708,6 @@ export const uz: typeof zhCN = {
       appearanceSystem: 'Tizimga ergashish',
       appearanceLight: "Yorug'",
       appearanceDark: "Qo'ng'ir",
-      language: 'Interfeys tili',
       font: 'Shrift hajmi',
       fontDesc: "Butun UI shrift hajmini kengaytirish — darhol kuchga kiradi.",
       fontSmall: 'Kichik',
@@ -741,8 +779,11 @@ export const uz: typeof zhCN = {
     title: 'Modellar',
     desc: "Mahalliy ASR modellarini boshqarish. Windows Microsoft Foundry Local Whisper dan foydalanishi mumkin; Qwen3-ASR model boshqaruvi alohida.",
     qwenTitle: 'Qwen3-ASR model menejer',
+    qwenExperimentalBadge: 'Eksperimental',
     engineUnavailable:
       "Qwen3-ASR inferansiya mexanizmi bu platformada to'planmagan. Modellarni yuklab olishingiz mumkin, lekin Qwen3-ASR hali bu yerda faollashtirish mumkin emas.",
+    qwenUnavailableOnWindows:
+      "Windows da Qwen3-ASR qo'llab-quvvatlanmaydi. Iltimos, yuqoridagi Foundry Local Whisper dan foydalaning.",
     foundryTitle: 'Windows Foundry Local Whisper',
     foundryDesc:
       "Windows bu qurilmada ASR API key talab qilmasdan nutqni tanish uchun Microsoft Foundry Local Whisper dan foydalanadi. Birinchi tayyorgarlik mahalliy runtime komponentlari va modelni yuklab oladi, keyin yuklaydi; LLM tahrirlash sozlangan LLM provayderingizdan foydalanadi.",

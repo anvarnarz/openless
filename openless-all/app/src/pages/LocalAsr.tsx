@@ -47,6 +47,7 @@ import {
 } from '../lib/localAsr';
 import { useHotkeySettings } from '../state/HotkeySettingsContext';
 import { detectOS } from '../components/WindowChrome';
+import { SelectLite } from '../components/ui/SelectLite';
 import { Btn, Card, PageHeader, Pill } from './_atoms';
 
 // Foundry Local Whisper 后端只在 Windows 编译实体（foundry_local_sdk 仅 Windows），
@@ -626,73 +627,52 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--ol-ink-4)' }}>
                 {t('localAsr.foundrySelectedModel')}
-                <select
+                <SelectLite
                   value={selectedFoundryAlias}
-                  onChange={e => {
+                  onChange={next => {
                     foundrySelectionDirty.current = true;
-                    setSelectedFoundryAlias(e.target.value as FoundryLocalAsrModelAlias);
+                    setSelectedFoundryAlias(next as FoundryLocalAsrModelAlias);
                   }}
                   disabled={foundryBusy !== null}
-                  style={{
-                    fontSize: 13,
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    border: '0.5px solid rgba(0,0,0,0.12)',
-                    background: 'var(--ol-surface)',
-                    color: 'var(--ol-ink)',
-                    minWidth: 260,
-                  }}>
-                  {FOUNDRY_LOCAL_ASR_MODELS.map(model => {
+                  options={FOUNDRY_LOCAL_ASR_MODELS.map(model => {
                     const catalog = foundryCatalog.find(item => item.alias === model.alias);
                     const sizeMb = formatFoundrySizeMb(catalog?.fileSizeMb);
-                    return (
-                      <option key={model.alias} value={model.alias}>
-                        {t(model.labelKey)}
-                        {sizeMb ? ` · ${t('localAsr.foundryApproxSizeMb', { mb: sizeMb })}` : ''}
-                      </option>
-                    );
+                    const sizeSuffix = sizeMb ? ` · ${t('localAsr.foundryApproxSizeMb', { mb: sizeMb })}` : '';
+                    return { value: model.alias, label: `${t(model.labelKey)}${sizeSuffix}` };
                   })}
-                </select>
+                  ariaLabel={t('localAsr.foundrySelectedModel')}
+                  style={{ fontSize: 13, background: 'var(--ol-surface)', minWidth: 260 }}
+                />
               </label>
               <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--ol-ink-4)' }}>
                 {t('localAsr.foundryRuntimeSourceLabel')}
-                <select
+                <SelectLite
                   value={selectedFoundryRuntimeSource}
-                  onChange={e => void handleFoundryRuntimeSourceChange(e.target.value as FoundryRuntimeSource)}
+                  onChange={next => void handleFoundryRuntimeSourceChange(next as FoundryRuntimeSource)}
                   disabled={foundryBusy !== null}
-                  style={{
-                    fontSize: 13,
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    border: '0.5px solid rgba(0,0,0,0.12)',
-                    background: 'var(--ol-surface)',
-                    color: 'var(--ol-ink)',
-                    minWidth: 200,
-                  }}>
-                  <option value="auto">{t('localAsr.foundryRuntimeSourceAuto')}</option>
-                  <option value="nuget">{t('localAsr.foundryRuntimeSourceNuget')}</option>
-                  <option value="ort-nightly">{t('localAsr.foundryRuntimeSourceOrtNightly')}</option>
-                </select>
+                  options={[
+                    { value: 'auto', label: t('localAsr.foundryRuntimeSourceAuto') },
+                    { value: 'nuget', label: t('localAsr.foundryRuntimeSourceNuget') },
+                    { value: 'ort-nightly', label: t('localAsr.foundryRuntimeSourceOrtNightly') },
+                  ]}
+                  ariaLabel={t('localAsr.foundryRuntimeSourceLabel')}
+                  style={{ fontSize: 13, background: 'var(--ol-surface)', minWidth: 200 }}
+                />
               </label>
               <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 11, color: 'var(--ol-ink-4)' }}>
                 {t('localAsr.foundryLanguageLabel')}
-                <select
+                <SelectLite
                   value={selectedFoundryLanguageHint}
-                  onChange={e => void handleFoundryLanguageChange(e.target.value as FoundryLocalAsrLanguageHint)}
+                  onChange={next => void handleFoundryLanguageChange(next as FoundryLocalAsrLanguageHint)}
                   disabled={foundryBusy !== null}
-                  style={{
-                    fontSize: 13,
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    border: '0.5px solid rgba(0,0,0,0.12)',
-                    background: 'var(--ol-surface)',
-                    color: 'var(--ol-ink)',
-                    minWidth: 132,
-                  }}>
-                  <option value="">{t('localAsr.foundryLanguageAuto')}</option>
-                  <option value="zh">{t('localAsr.foundryLanguageZh')}</option>
-                  <option value="en">{t('localAsr.foundryLanguageEn')}</option>
-                </select>
+                  options={[
+                    { value: '', label: t('localAsr.foundryLanguageAuto') },
+                    { value: 'zh', label: t('localAsr.foundryLanguageZh') },
+                    { value: 'en', label: t('localAsr.foundryLanguageEn') },
+                  ]}
+                  ariaLabel={t('localAsr.foundryLanguageLabel')}
+                  style={{ fontSize: 13, background: 'var(--ol-surface)', minWidth: 132 }}
+                />
               </label>
             </div>
           </div>
@@ -778,12 +758,26 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
       </Card>
       )}
 
-      {/* Qwen3 模型管理区——只在 macOS 渲染（后端 #[cfg(target_os = "macos")] 独占）。
-          Windows / Linux 看见镜像源 / 下载 / 模型列表都是 dead UI。Foundry 块自身已经
-          被上方 IS_WINDOWS 守卫，错误 Card（共享 setError，被 Foundry handler 也写）
-          保持无条件露出。 */}
-      {IS_MAC && (<>
-      {!engineAvailable && (
+      {/* Qwen3 模型管理区——macOS 是实体后端（#[cfg(target_os = "macos")]），Windows
+          上 backend 永远 unavailable，但 PO 要求 Windows 用户仍能看见这块，整体
+          灰显 + 禁用交互 + 顶部横幅说明不可用，引导他们使用上方 Foundry Local Whisper。
+          Linux 当前没有任何本地 ASR 提供，沿用 IS_MAC 隐藏（dead UI 仍然要藏）。 */}
+      {(IS_MAC || IS_WINDOWS) && (<>
+      {/* v1.3.1-6 用户反馈：Windows 顶部"暂不支持"banner 白底太显眼。已经整段 opacity/grayscale
+          + inert 灰显 + 不可交互了，banner 是 noise，直接删。AT 仍可通过区域 aria-disabled
+          + 灰显视觉判断不可用。 */}
+      <div
+        aria-disabled={IS_WINDOWS || undefined}
+        // @ts-expect-error — `inert` 是 HTML5 标准属性（React 19+ 一类型，TS lib.dom 旧版未收录）。
+        // 跟 pointerEvents:none 配合让键盘 Tab 也跳过区域内所有 focusable 控件，避免 AT 用户
+        // 激活无效后端的 IPC（review-qwen3 High）。
+        inert={IS_WINDOWS || undefined}
+        style={
+          IS_WINDOWS
+            ? { opacity: 0.5, filter: 'grayscale(0.4)', pointerEvents: 'none' as const }
+            : undefined
+        }>
+      {IS_MAC && !engineAvailable && (
         <Card style={{ marginBottom: 16, background: 'rgba(255, 235, 200, 0.4)' }}>
           <div style={{ fontSize: 13, color: 'var(--ol-ink-2)' }}>
             {t('localAsr.engineUnavailable')}
@@ -791,8 +785,17 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         </Card>
       )}
 
-      <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ol-ink)', margin: '4px 0 10px' }}>
-        {t('localAsr.qwenTitle')}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '4px 0 10px' }}>
+        {/* v1.3.1-6 用户拍板：千问3 ASR 改为「实验性」分组，独立于 Foundry/云端 ASR。
+            浅 amber badge 跟 thinking 扫光暖色调一致。 */}
+        <span style={{
+          fontSize: 10.5, fontWeight: 600, padding: '2px 7px', borderRadius: 4,
+          background: 'rgba(245, 158, 11, 0.15)', color: '#B45309',
+          letterSpacing: '0.02em', textTransform: 'uppercase',
+        }}>{t('localAsr.qwenExperimentalBadge')}</span>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--ol-ink)' }}>
+          {t('localAsr.qwenTitle')}
+        </div>
       </div>
 
       <Card style={{ marginBottom: 16 }}>
@@ -805,21 +808,16 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
               {t('localAsr.mirrorDesc')}
             </div>
           </div>
-          <select
+          <SelectLite
             value={settings?.mirror ?? 'huggingface'}
-            onChange={e => void handleMirrorChange(e.target.value)}
-            style={{
-              fontSize: 13,
-              padding: '6px 10px',
-              borderRadius: 8,
-              border: '0.5px solid rgba(0,0,0,0.12)',
-              background: 'var(--ol-surface)',
-              color: 'var(--ol-ink)',
-              minWidth: 200,
-            }}>
-            <option value="huggingface">{t('localAsr.mirrorHuggingface')}</option>
-            <option value="hf-mirror">{t('localAsr.mirrorHfMirror')}</option>
-          </select>
+            onChange={next => void handleMirrorChange(next)}
+            options={[
+              { value: 'huggingface', label: t('localAsr.mirrorHuggingface') },
+              { value: 'hf-mirror', label: t('localAsr.mirrorHfMirror') },
+            ]}
+            ariaLabel={t('localAsr.mirrorLabel')}
+            style={{ fontSize: 13, background: 'var(--ol-surface)', minWidth: 200 }}
+          />
         </div>
       </Card>
 
@@ -859,28 +857,24 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                   {t('localAsr.keepLoadedDesc')}
                 </div>
               </div>
-              <select
-                value={engineStatus?.keepLoadedSecs ?? 300}
-                onChange={e => void handleKeepLoadedChange(Number(e.target.value))}
-                style={{
-                  fontSize: 13,
-                  padding: '6px 10px',
-                  borderRadius: 8,
-                  border: '0.5px solid rgba(0,0,0,0.12)',
-                  background: 'var(--ol-surface)',
-                  color: 'var(--ol-ink)',
-                  minWidth: 200,
-                }}>
-                <option value={0}>{t('localAsr.keepImmediate')}</option>
-                <option value={60}>{t('localAsr.keep1min')}</option>
-                <option value={300}>{t('localAsr.keep5min')}</option>
-                <option value={1800}>{t('localAsr.keep30min')}</option>
-                <option value={86400}>{t('localAsr.keepForever')}</option>
-              </select>
+              <SelectLite
+                value={String(engineStatus?.keepLoadedSecs ?? 300)}
+                onChange={next => void handleKeepLoadedChange(Number(next))}
+                options={[
+                  { value: '0', label: t('localAsr.keepImmediate') },
+                  { value: '60', label: t('localAsr.keep1min') },
+                  { value: '300', label: t('localAsr.keep5min') },
+                  { value: '1800', label: t('localAsr.keep30min') },
+                  { value: '86400', label: t('localAsr.keepForever') },
+                ]}
+                ariaLabel={t('localAsr.keepLoadedLabel')}
+                style={{ fontSize: 13, background: 'var(--ol-surface)', minWidth: 200 }}
+              />
             </div>
           </div>
         </Card>
       )}
+      </div>
       </>)}
 
       {error && (
@@ -889,26 +883,44 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         </Card>
       )}
 
-      {IS_MAC && (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        {models.map(model => (
-          <ModelRow
-            key={model.id}
-            model={model}
-            remoteSize={remoteSizes[model.id]}
-            progress={progress[model.id]}
-            isActive={settings?.activeModel === model.id}
-            engineAvailable={engineAvailable}
-            disabled={busyModelId !== null && busyModelId !== model.id}
-            testing={testingModelId === model.id}
-            testResult={testResults[model.id]}
-            onDownload={() => void handleDownload(model.id)}
-            onCancel={() => void handleCancel(model.id)}
-            onDelete={() => void handleDelete(model.id)}
-            onSetActive={() => void handleSetActiveModel(model.id)}
-            onTest={() => void handleTest(model.id)}
-          />
-        ))}
+      {(IS_MAC || IS_WINDOWS) && (
+      <div
+        aria-disabled={IS_WINDOWS || undefined}
+        // @ts-expect-error — `inert` 是 HTML5 标准属性（React 19+ 一类型，TS lib.dom 旧版未收录）。
+        // 跟 pointerEvents:none 配合让键盘 Tab 也跳过区域内所有 focusable 控件，避免 AT 用户
+        // 激活无效后端的 IPC（review-qwen3 High）。
+        inert={IS_WINDOWS || undefined}
+        style={
+          IS_WINDOWS
+            ? { opacity: 0.5, filter: 'grayscale(0.4)', pointerEvents: 'none' as const }
+            : undefined
+        }>
+        {IS_MAC ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {models.map(model => (
+              <ModelRow
+                key={model.id}
+                model={model}
+                remoteSize={remoteSizes[model.id]}
+                progress={progress[model.id]}
+                isActive={settings?.activeModel === model.id}
+                engineAvailable={engineAvailable}
+                disabled={busyModelId !== null && busyModelId !== model.id}
+                testing={testingModelId === model.id}
+                testResult={testResults[model.id]}
+                onDownload={() => void handleDownload(model.id)}
+                onCancel={() => void handleCancel(model.id)}
+                onDelete={() => void handleDelete(model.id)}
+                onSetActive={() => void handleSetActiveModel(model.id)}
+                onTest={() => void handleTest(model.id)}
+              />
+            ))}
+          </div>
+        ) : (
+          /* v1.3.1-6: Windows 列表为空时不再画白底 banner Card（用户反馈"白色显眼"），
+              留个低调的灰色 placeholder 维持容器高度。整段已 inert + 灰显，AT 用户感知到的也是"不可用"。 */
+          <div style={{ minHeight: 60 }} />
+        )}
       </div>
       )}
     </Wrapper>

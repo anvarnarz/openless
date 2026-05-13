@@ -88,6 +88,53 @@ pub enum ActiveLLMProvider {
 }
 
 impl ActiveLLMProvider {
+    /// v1 流式润色只在 OpenAI-compatible 走通；Codex 走 Responses API，shape 与
+    /// chat completions SSE 不同，留给 v2。Gemini 在 coordinator.rs 路径上自己分流，
+    /// 不进 ActiveLLMProvider 枚举。
+    pub fn supports_streaming_polish(&self) -> bool {
+        matches!(self, Self::OpenAI(_))
+    }
+
+    pub async fn polish_streaming<F, C>(
+        &self,
+        raw_text: &str,
+        mode: PolishMode,
+        hotwords: &[String],
+        working_languages: &[String],
+        chinese_script_preference: ChineseScriptPreference,
+        output_language_preference: OutputLanguagePreference,
+        front_app: Option<&str>,
+        prior_turns: &[(String, String)],
+        on_delta: F,
+        should_cancel: C,
+    ) -> Result<String, LLMError>
+    where
+        F: Fn(&str) + Send + Sync,
+        C: Fn() -> bool + Send + Sync,
+    {
+        match self {
+            Self::OpenAI(provider) => {
+                provider
+                    .polish_streaming(
+                        raw_text,
+                        mode,
+                        hotwords,
+                        working_languages,
+                        chinese_script_preference,
+                        output_language_preference,
+                        front_app,
+                        prior_turns,
+                        on_delta,
+                        should_cancel,
+                    )
+                    .await
+            }
+            Self::Codex(_) => Err(LLMError::Network(
+                "streaming polish not implemented for codex provider (v1)".into(),
+            )),
+        }
+    }
+
     pub async fn polish(
         &self,
         raw_text: &str,
@@ -260,6 +307,49 @@ impl OpenAICompatibleLLMProvider {
             self.chat_completion_with_polish_history(&system_prompt, prior_turns, &user_prompt)
                 .await
         }
+    }
+
+    /// 润色路径的**流式**变体。Prompts 与 `polish()` 完全同源（共用 `compose_polish_prompts`
+    /// + `build_polish_history_messages`），只是 body 开 `stream: true`，SSE 一帧一帧
+    /// 喂给 `on_delta`。最终返回拼好的完整字符串供调用方写 history / 记词条命中。
+    /// `should_cancel` 让上层在用户取消时立即 break SSE 读循环，避免烧 LLM quota。
+    pub async fn polish_streaming<F, C>(
+        &self,
+        raw_text: &str,
+        mode: PolishMode,
+        hotwords: &[String],
+        working_languages: &[String],
+        chinese_script_preference: ChineseScriptPreference,
+        output_language_preference: OutputLanguagePreference,
+        front_app: Option<&str>,
+        prior_turns: &[(String, String)],
+        on_delta: F,
+        should_cancel: C,
+    ) -> Result<String, LLMError>
+    where
+        F: Fn(&str) + Send + Sync,
+        C: Fn() -> bool + Send + Sync,
+    {
+        let (system_prompt, user_prompt) = compose_polish_prompts(
+            raw_text,
+            mode,
+            hotwords,
+            working_languages,
+            chinese_script_preference,
+            output_language_preference,
+            front_app,
+            !prior_turns.is_empty(),
+        );
+        let messages = build_polish_history_messages(&system_prompt, prior_turns, &user_prompt);
+        log::info!(
+            "[llm] polish_streaming provider={} model={} prior_turns={} raw_chars={}",
+            self.config.provider_id,
+            self.config.model,
+            prior_turns.len(),
+            raw_text.chars().count()
+        );
+        self.chat_completion_messages_streaming(messages, on_delta, should_cancel)
+            .await
     }
 
     /// 多轮划词追问，**流式**返回。`messages` 包含历史对话（user/assistant 交替），
@@ -497,12 +587,15 @@ impl OpenAICompatibleLLMProvider {
         // 一个 chunk() 可能包含半帧或多帧；用 buffer 累积后再按 `\n\n` 切。
         let mut response = response;
         let mut buffer = String::new();
+        let mut utf8_pending: Vec<u8> = Vec::new();
         let mut full_text = String::new();
+        let mut cancelled = false;
         loop {
             // 取消旗标：用户取消 / 关浮窗时立即 break，不再 drain HTTP body。
             // 否则 reqwest 会读完整个流（包括 LLM 后续 token）烧 quota。详见 issue #161。
             if should_cancel() {
                 log::info!("[llm] stream cancelled by caller; breaking SSE loop");
+                cancelled = true;
                 break;
             }
             let chunk_opt = response
@@ -510,9 +603,7 @@ impl OpenAICompatibleLLMProvider {
                 .await
                 .map_err(|e| LLMError::Network(e.to_string()))?;
             let Some(chunk) = chunk_opt else { break };
-            let s = std::str::from_utf8(&chunk)
-                .map_err(|e| LLMError::Network(format!("non-utf8 SSE chunk: {e}")))?;
-            buffer.push_str(s);
+            append_utf8_sse_chunk(&mut buffer, &mut utf8_pending, &chunk)?;
 
             while let Some(idx) = buffer.find("\n\n") {
                 let event = buffer[..idx].to_string();
@@ -547,6 +638,9 @@ impl OpenAICompatibleLLMProvider {
                 }
             }
         }
+        if !cancelled {
+            finish_utf8_sse_chunks(&mut buffer, &mut utf8_pending)?;
+        }
 
         log::info!(
             "[llm] HTTP 200 stream done; total chars={}",
@@ -557,6 +651,137 @@ impl OpenAICompatibleLLMProvider {
             return Err(LLMError::InvalidResponse {
                 status: 200,
                 body: "empty stream".to_string(),
+            });
+        }
+        Ok(full_text)
+    }
+
+    /// 把已经构造好的 `messages` 列表（包含 system + 历史 + 当前 user）作为
+    /// `stream: true` 的 body 发出去，SSE 一帧一帧解析。供 `polish_streaming` 复用，
+    /// 跟 `chat_completion_history_streaming` 的 SSE 解析逻辑同款 —— 后者多了一步从
+    /// `QaChatMessage[]` 装配 messages 的工作。
+    async fn chat_completion_messages_streaming<F, C>(
+        &self,
+        messages: Vec<Value>,
+        on_delta: F,
+        should_cancel: C,
+    ) -> Result<String, LLMError>
+    where
+        F: Fn(&str) + Send + Sync,
+        C: Fn() -> bool + Send + Sync,
+    {
+        let url = chat_completions_url(&self.config.base_url);
+        let body = self.chat_body(true, messages);
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        if !self.config.api_key.trim().is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", self.config.api_key));
+        }
+        for (k, v) in &self.config.extra_headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+        let request = request.json(&body);
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_timeout() {
+                    return Err(LLMError::Timeout);
+                }
+                return Err(LLMError::Network(e.to_string()));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response
+                .text()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
+            let preview_end = BODY_PREVIEW_LIMIT.min(body_text.len());
+            let preview = safe_str_slice(&body_text, preview_end);
+            log::error!("[llm] streaming HTTP {} body={}", status.as_u16(), preview);
+            return Err(LLMError::InvalidResponse {
+                status: status.as_u16(),
+                body: preview.to_string(),
+            });
+        }
+
+        let mut response = response;
+        let mut buffer = String::new();
+        let mut utf8_pending: Vec<u8> = Vec::new();
+        let mut full_text = String::new();
+        let mut delta_count: u64 = 0;
+        let mut cancelled = false;
+        loop {
+            if should_cancel() {
+                log::info!(
+                    "[llm] polish stream cancelled by caller after {} deltas ({} chars); breaking SSE loop",
+                    delta_count,
+                    full_text.chars().count()
+                );
+                cancelled = true;
+                break;
+            }
+            let chunk_opt = response
+                .chunk()
+                .await
+                .map_err(|e| LLMError::Network(e.to_string()))?;
+            let Some(chunk) = chunk_opt else { break };
+            append_utf8_sse_chunk(&mut buffer, &mut utf8_pending, &chunk)?;
+
+            while let Some(idx) = buffer.find("\n\n") {
+                let event = buffer[..idx].to_string();
+                buffer.drain(..idx + 2);
+                for line in event.lines() {
+                    let Some(payload) = line
+                        .strip_prefix("data: ")
+                        .or_else(|| line.strip_prefix("data:"))
+                    else {
+                        continue;
+                    };
+                    let payload = payload.trim();
+                    if payload.is_empty() || payload == "[DONE]" {
+                        continue;
+                    }
+                    let v: Value = match serde_json::from_str(payload) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::warn!(
+                                "[llm] polish SSE parse skip: {e}; payload preview: {}",
+                                safe_str_slice(payload, 80)
+                            );
+                            continue;
+                        }
+                    };
+                    if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                        if !delta.is_empty() {
+                            full_text.push_str(delta);
+                            delta_count += 1;
+                            on_delta(delta);
+                        }
+                    }
+                }
+            }
+        }
+        if !cancelled {
+            finish_utf8_sse_chunks(&mut buffer, &mut utf8_pending)?;
+        }
+
+        log::info!(
+            "[llm] polish stream done; total deltas={} chars={}",
+            delta_count,
+            full_text.chars().count()
+        );
+
+        if full_text.is_empty() {
+            return Err(LLMError::InvalidResponse {
+                status: 200,
+                body: "empty polish stream".to_string(),
             });
         }
         Ok(full_text)
@@ -848,11 +1073,14 @@ impl CodexOAuthLLMProvider {
 
         let mut response = response;
         let mut buffer = String::new();
+        let mut utf8_pending: Vec<u8> = Vec::new();
         let mut full_text = String::new();
         let mut final_text = String::new();
+        let mut cancelled = false;
         loop {
             if should_cancel() {
                 log::info!("[llm] codex stream cancelled by caller; breaking SSE loop");
+                cancelled = true;
                 break;
             }
             let chunk_opt = response
@@ -860,15 +1088,16 @@ impl CodexOAuthLLMProvider {
                 .await
                 .map_err(|e| LLMError::Network(e.to_string()))?;
             let Some(chunk) = chunk_opt else { break };
-            let s = std::str::from_utf8(&chunk)
-                .map_err(|e| LLMError::Network(format!("non-utf8 SSE chunk: {e}")))?;
-            buffer.push_str(s);
+            append_utf8_sse_chunk(&mut buffer, &mut utf8_pending, &chunk)?;
 
             while let Some(idx) = buffer.find("\n\n") {
                 let event = buffer[..idx].to_string();
                 buffer.drain(..idx + 2);
                 handle_codex_sse_event(&event, &mut full_text, &mut final_text, &on_delta);
             }
+        }
+        if !cancelled {
+            finish_utf8_sse_chunks(&mut buffer, &mut utf8_pending)?;
         }
         if !buffer.trim().is_empty() {
             handle_codex_sse_event(&buffer, &mut full_text, &mut final_text, &on_delta);
@@ -888,6 +1117,51 @@ impl CodexOAuthLLMProvider {
             });
         }
         Ok(clean_polish_output(&full_text))
+    }
+}
+
+fn append_utf8_sse_chunk(
+    buffer: &mut String,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(), LLMError> {
+    pending.extend_from_slice(chunk);
+    drain_complete_utf8(buffer, pending)
+}
+
+fn finish_utf8_sse_chunks(buffer: &mut String, pending: &mut Vec<u8>) -> Result<(), LLMError> {
+    drain_complete_utf8(buffer, pending)?;
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err(LLMError::Network(
+            "non-utf8 SSE chunk: stream ended in the middle of a UTF-8 codepoint".to_string(),
+        ))
+    }
+}
+
+fn drain_complete_utf8(buffer: &mut String, pending: &mut Vec<u8>) -> Result<(), LLMError> {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                buffer.push_str(s);
+                pending.clear();
+                return Ok(());
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&pending[..valid_up_to]).expect("valid prefix");
+                    buffer.push_str(valid);
+                    pending.drain(..valid_up_to);
+                    continue;
+                }
+                if e.error_len().is_none() {
+                    return Ok(());
+                }
+                return Err(LLMError::Network(format!("non-utf8 SSE chunk: {e}")));
+            }
+        }
     }
 }
 
@@ -1620,7 +1894,7 @@ pub mod prompts {
         - 措辞优先用原句字面词；理解到的用户意图用来贴近原话表达，\u{4E0D}要替用户重写或扩写。\n\
         - \u{4E0D}创作，\u{4E0D}补充用户没说过的事实、字段、实现方案或功能清单。\n\
         - 转写里有未解决的问题或待确认事项，全部列为条目保留，\u{4E0D}省略、\u{4E0D}替用户判断。\n\
-        - 用户意图难以判断或无法确认时，\u{4E0D}要强行推断；改为只做句子层面的整理（标点、断句、口癖去除）。\n\
+        - 当用户意图难以判断或无法确认时，\u{4E0D}要强行推断，改为只做结构和句子化的强制整理，直接整理成结构化输出，确保实际输出与用户想要的结构一致，并尽量贴近用户的原意。\n\
         - \u{4E0D}引用任何会话历史、上一段语音、项目上下文、外部知识或模型记忆；每次请求都是独立任务。";
 
     const COMMON_RULES: &str = "# 通用规则\n\
@@ -1636,7 +1910,13 @@ pub mod prompts {
     const OUTPUT_BLOCK: &str = "# 输出\n\
         直接输出最终文本正文。需要结构化时直接从标题 / 段落 / 编号开始。\n\
         禁止以\u{201C}根据你/您给的内容\u{201D}\u{201C}我整理如下\u{201D}\u{201C}以下是整理后的内容\u{201D}\u{201C}优化如下\u{201D}\u{201C}结构化整理如下\u{201D}等句式开头。\n\
-        \u{4E0D}加解释、总结、客套话、代码围栏（\\`\\`\\`）或 markdown 元注释。";
+        \u{4E0D}加解释、总结、客套话、代码围栏（\\`\\`\\`）或 markdown 元注释。\n\
+        \n\
+        # 反 AI 自述式表达（强约束）\n\
+        - \u{4E0D}加 AI 自评 / 自述视角的语句：\u{201C}\u{6211}\u{4EEC}\u{770B}\u{4E86}\u{4E00}\u{4E0B}\u{201D}\u{201C}\u{6211}\u{4EEC}\u{53D1}\u{73B0}\u{201D}\u{201C}\u{7ECF}\u{8FC7}\u{5206}\u{6790}\u{201D}\u{201C}\u{7EFC}\u{5408}\u{6765}\u{770B}\u{201D}\u{201C}\u{603B}\u{4F53}\u{800C}\u{8A00}\u{201D}\u{201C}\u{6574}\u{4F53}\u{6765}\u{8BF4}\u{201D}\u{201C}\u{4F9D}\u{6211}\u{6240}\u{89C1}\u{201D}\u{201C}\u{6839}\u{636E}\u{60C5}\u{51B5}\u{201D}\u{201C}\u{4ECE}\u{7ED3}\u{679C}\u{6765}\u{770B}\u{201D}\u{7B49}\u{3002}\n\
+        - 保持原句的人称视角：原句是\u{201C}\u{6211}\u{201D}就用\u{201C}\u{6211}\u{201D}，原句没有\u{201C}\u{6211}\u{4EEC}\u{201D}/\u{201C}\u{54B1}\u{4EEC}\u{201D}就\u{4E0D}凭空引入。\n\
+        - 直陈用户的实际诉求：原句说\u{201C}没问题\u{201D}就输出\u{201C}没问题\u{201D}，\u{4E0D}扩写为\u{201C}\u{6211}\u{4EEC}\u{770B}\u{4E86}\u{4E00}\u{4E0B}\u{6CA1}\u{4EC0}\u{4E48}\u{5927}\u{95EE}\u{9898}\u{201D}\u{3002}\n\
+        - \u{4E0D}加修饰副词或铺垫句（\u{201C}\u{503C}\u{5F97}\u{4E00}\u{63D0}\u{7684}\u{662F}\u{201D}\u{201C}\u{503C}\u{5F97}\u{6CE8}\u{610F}\u{201D}\u{201C}\u{503C}\u{5F97}\u{8003}\u{8651}\u{201D}\u{7B49}\u{6F2B}\u{8C08}\u{8FC7}\u{6E21}\u{53E5}）\u{3002}";
 
     pub fn system_prompt(mode: PolishMode) -> String {
         let task_and_example = match mode {
@@ -1654,13 +1934,40 @@ pub mod prompts {
                 去掉明显口癖、重复、无意义停顿；补充自然标点。\n\
                 保留用户原意、语气和表达习惯；\u{4E0D}扩写、\u{4E0D}创作。\n\
                 \n\
-                # 示例\n\
+                **工程化直陈**：开发协作 / 任务清单 / 技术沟通 / 工作汇报等场景下，按\u{4E3B}\u{8C13}\u{5BBE}陈述事实，\
+                \u{4E0D}加修饰副词、铺垫句、AI 自述（\u{201C}\u{6211}\u{4EEC}\u{770B}\u{4E86}\u{4E00}\u{4E0B}\u{201D}\u{201C}\u{603B}\u{4F53}\u{6765}\u{8BF4}\u{201D}等）。\
+                输出长度尽量贴近原句字数（± 20% 以内），\u{4E0D}让\u{8F7B}\u{5EA6}\u{6DA6}\u{8272}变成扩写。\n\
+                \n\
+                # 示例 1\n\
                 原：那个我觉得这个方案吧大概可以但是可能在性能上还要再看看\n\
-                出：我觉得这个方案大概可以，但性能上还要再看看。",
+                出：我觉得这个方案大概可以，但性能上还要再看看。\n\
+                \n\
+                # 示例 2（工程化直陈，\u{4E0D}加 AI 自述）\n\
+                原：嗯我们目前看了一下没什么大问题就是缓存策略可能要改一下\n\
+                出：目前没什么大问题，缓存策略需要调整。\
+                \u{200B}（注意：原句\u{6CA1}\u{6709}\u{660E}\u{786E}\u{7684}\u{201C}\u{6211}\u{4EEC}\u{201D}\u{4F5C}\u{4E3A}\u{96C6}\u{4F53}，不引入\u{201C}\u{6211}\u{4EEC}\u{770B}\u{4E86}\u{4E00}\u{4E0B}\u{201D}\u{8FD9}\u{79CD}\u{81EA}\u{8FF0}\u{8868}\u{8FBE}）",
 
             PolishMode::Structured => "# 任务（清晰结构）\n\
                 把口述整理为脉络清晰、可直接复制走的结构化文本：保留用户的口语引子（润色后作为首行过渡），\
                 主动按语义把扁平事项归类成 2\u{2013}4 个主题，用双层格式呈现，尾巴查询用自然收尾句。\n\
+                \n\
+                **默认行为：双层 list。判断事项的标准**：\
+                以下任意一种都算一个事项 \u{2192} \u{4E0D}\u{4F9D}\u{8D56}\u{7528}\u{6237}\u{662F}\u{5426}\u{660E}\u{8BF4}\u{201C}\u{7B2C}\u{4E00}\u{201D}\u{201C}\u{7B2C}\u{4E8C}\u{201D}\u{201C}\u{53E6}\u{5916}\u{201D}\u{7B49}\u{8FDE}\u{63A5}\u{8BCD}\u{3002}\n\
+                \u{2003}\u{2003}1) 可独立成句的陈述（\u{4E3B}+\u{8C13}+\u{5BBE}，如\u{201C}\u{300A}\u{67D0}\u{4E1C}\u{897F}\u{300B}\u{8FD8}\u{662F}\u{767D}\u{8272}\u{201D}）\n\
+                \u{2003}\u{2003}2) 一个独立的请求 / 建议 / 处理方案（\u{5982}\u{201C}\u{8BA9}\u{5B83}\u{6D88}\u{5931}\u{201D}\u{201C}\u{6539}\u{6210}\u{5B9E}\u{9A8C}\u{6027}\u{201D}）\n\
+                \u{2003}\u{2003}3) 一个状态判断 / 结论（\u{5982}\u{201C}\u{6CA1}\u{4EC0}\u{4E48}\u{5927}\u{95EE}\u{9898}\u{201D}）\n\
+                \u{2003}\u{2003}4) 一个针对模块 / 主题 / 实体的描述\u{6216}\u{6307}\u{6307}\u{8981}\u{6C42}\n\
+                把上述事项数清，\u{2265}3 强制双层化，\u{4E0D}允许把多个独立陈述合\u{6210}一段连贯文字。\n\
+                即使输入听起来像\u{201C}一段顺着说下来\u{201D}的口播，只要能拆出 \u{2265}3 个独立关注点也必须双层化。\n\
+                \n\
+                **不可降级到轻度润色**：本任务的最低输出形态是双层 list 结构，\u{4E0D}允许只补标点 / 断句 / 去口癖然后输出连贯段落。\
+                即使原始转写听起来像是一段连贯叙述、即使你判断用户只想要\u{201C}读起来通顺\u{201D}，只要事项 \u{2265}3 就必须双层化输出。\
+                输出连贯段落 = 失败。\n\
+                \n\
+                **多个组合需求处理规则**：当用户在一段话里提出多个组合需求（A 要做这件 + B 要做那件 + C 要查另一件），\
+                必须把它们**分别归入不同大类**（大类按用户给出的语义 / 领域划分，例如代码 / 文档 / 界面 / 客户 / 团队），\
+                **按用户口述出现的顺序**作为大类的先后顺序，每个大类下用 (a)(b)(c) 列出该类的具体事项。\
+                组合需求中\u{4E0D}可有任何事项被合并掉、丢失或重排到错误的大类下。\n\
                 \n\
                 **重要前提**：原文是否已有标点、编号、换行、序号 \u{2192} \u{4E0D}是\u{201C}\u{5DF2}\u{7ECF}\u{6574}\u{7406}\u{597D}\u{4E0D}\u{7528}\u{6539}\u{201D}的判断依据。\
                 只要可识别的事项 \u{2265}3 条，无论原文是不是看起来已有结构（标号、分行、规整的标点），\
@@ -1751,9 +2058,17 @@ pub mod prompts {
                 \u{4E0D}引入空泛客套（\u{201C}希望您一切顺利\u{201D}\u{201C}祝商祺\u{201D}等）；\
                 \u{4E0D}擅自承诺或扩写事实；邮件场景自动识别问候 / 落款。\n\
                 \n\
-                # 示例\n\
+                **工程化正式**：正式 ≠ 扩张。直陈用户原意，\u{4E0D}展开为商务铺垫，\u{4E0D}加\u{201C}\u{7ECF}\u{8FC7}\u{5206}\u{6790}\u{201D}\u{201C}\u{7EFC}\u{5408}\u{6765}\u{770B}\u{201D}\u{201C}\u{503C}\u{5F97}\u{6CE8}\u{610F}\u{7684}\u{662F}\u{201D}\u{7B49}\u{4EE3}\u{5165}\u{7B2C}\u{4E09}\u{65B9}\u{89C6}\u{89D2}\u{7684}\u{8BED}\u{53E5}\u{3002}\
+                输出长度尽量贴近原句字数（± 30% 以内），\u{4E0D}让\u{6B63}\u{5F0F}\u{5316}\u{6269}\u{5F20}\u{5230}\u{4E24}\u{500D}\u{957F}\u{5EA6}\u{3002}\n\
+                \n\
+                # 示例 1\n\
                 原：那个老板我跟你说下今天的发布我们可能要推迟因为测试还没跑完\n\
-                出：今天的发布需要推迟，原因是测试尚未完成。",
+                出：今天的发布需要推迟，原因是测试尚未完成。\n\
+                \n\
+                # 示例 2（工程化正式，\u{4E0D}加铺垫与代入语）\n\
+                原：嗯这次发版前我们看了一下其实问题不大但还是建议把缓存改一改\n\
+                出：本次发版整体问题不大，建议调整缓存策略。\
+                \u{200B}（注意：\u{4E0D}写\u{201C}\u{6211}\u{4EEC}\u{770B}\u{4E86}\u{4E00}\u{4E0B}\u{201D}\u{201C}\u{7ECF}\u{8FC7}\u{8BC4}\u{4F30}\u{201D}\u{4E4B}\u{7C7B}\u{4EE3}\u{5165}\u{8BED}）",
         };
 
         format!(
@@ -1928,6 +2243,136 @@ mod tests {
         format!("{}.{}.sig", header, payload)
     }
 
+    #[test]
+    fn utf8_sse_decoder_preserves_multibyte_split_across_chunks() {
+        let mut buffer = String::new();
+        let mut pending = Vec::new();
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"你好🙂\"}}]}\n\n";
+        let bytes = event.as_bytes();
+        let split = event.find("好").expect("contains CJK char") + 1;
+
+        append_utf8_sse_chunk(&mut buffer, &mut pending, &bytes[..split]).unwrap();
+        assert!(!pending.is_empty());
+        assert!(!buffer.contains('好'));
+
+        append_utf8_sse_chunk(&mut buffer, &mut pending, &bytes[split..]).unwrap();
+        finish_utf8_sse_chunks(&mut buffer, &mut pending).unwrap();
+        assert_eq!(buffer, event);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn utf8_sse_decoder_rejects_invalid_byte() {
+        let mut buffer = String::new();
+        let mut pending = Vec::new();
+        let err = append_utf8_sse_chunk(&mut buffer, &mut pending, b"data: \xff\n\n")
+            .expect_err("invalid byte should fail");
+        assert!(err.to_string().contains("non-utf8 SSE chunk"));
+    }
+
+    #[test]
+    fn utf8_sse_decoder_rejects_unfinished_codepoint_on_finish() {
+        let mut buffer = String::new();
+        let mut pending = Vec::new();
+        append_utf8_sse_chunk(&mut buffer, &mut pending, &[0xE4]).unwrap();
+        let err = finish_utf8_sse_chunks(&mut buffer, &mut pending)
+            .expect_err("unfinished codepoint should fail at EOF");
+        assert!(err.to_string().contains("middle of a UTF-8 codepoint"));
+    }
+
+    #[tokio::test]
+    async fn polish_streaming_handles_multibyte_split_in_http_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"你🙂好\"}}]}\n\n";
+        let split = split_inside(event, "🙂");
+        let first = event.as_bytes()[..split].to_vec();
+        let second = event.as_bytes()[split..].to_vec();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /chat/completions HTTP/1.1"));
+            write_chunked_sse_response(&mut stream, &[&first, &second]);
+        });
+
+        let provider = OpenAICompatibleLLMProvider::new(OpenAICompatibleConfig::new(
+            "ark",
+            "Ark",
+            format!("http://{}", addr),
+            "",
+            "test-model",
+        ));
+        let deltas = StdMutex::new(String::new());
+        let output = provider
+            .polish_streaming(
+                "原文",
+                PolishMode::Raw,
+                &[],
+                &[],
+                ChineseScriptPreference::Auto,
+                OutputLanguagePreference::Auto,
+                None,
+                &[],
+                |delta| deltas.lock().unwrap().push_str(delta),
+                || false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output, "你🙂好");
+        assert_eq!(*deltas.lock().unwrap(), "你🙂好");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn qa_streaming_handles_multibyte_split_in_http_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"答🙂案\"}}]}\n\n";
+        let split = split_inside(event, "🙂");
+        let first = event.as_bytes()[..split].to_vec();
+        let second = event.as_bytes()[split..].to_vec();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /chat/completions HTTP/1.1"));
+            write_chunked_sse_response(&mut stream, &[&first, &second]);
+        });
+
+        let provider = OpenAICompatibleLLMProvider::new(OpenAICompatibleConfig::new(
+            "ark",
+            "Ark",
+            format!("http://{}", addr),
+            "",
+            "test-model",
+        ));
+        let messages = vec![QaChatMessage {
+            role: "user".into(),
+            content: "问题".into(),
+        }];
+        let deltas = StdMutex::new(String::new());
+        let output = provider
+            .answer_chat_streaming(
+                &messages,
+                &[],
+                ChineseScriptPreference::Auto,
+                OutputLanguagePreference::Auto,
+                None,
+                |delta| deltas.lock().unwrap().push_str(delta),
+                || false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output, "答🙂案");
+        assert_eq!(*deltas.lock().unwrap(), "答🙂案");
+        server.join().unwrap();
+    }
+
     fn base64_url_no_pad(input: &str) -> String {
         const TABLE: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -1977,6 +2422,24 @@ mod tests {
             }
         }
         request
+    }
+
+    fn write_chunked_sse_response(stream: &mut std::net::TcpStream, chunks: &[&[u8]]) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        for chunk in chunks {
+            write!(stream, "{:X}\r\n", chunk.len()).unwrap();
+            stream.write_all(chunk).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").unwrap();
+    }
+
+    fn split_inside(haystack: &str, needle: &str) -> usize {
+        haystack.find(needle).expect("needle exists") + 1
     }
 
     // ──────────────── 对话感知 polish 的 chat 消息构造 ────────────────
@@ -2473,16 +2936,15 @@ mod tests {
             assert!(!request_text.contains(r#""temperature":"#));
 
             let body = concat!(
-                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"最终\"}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"最终🙂\"}\n\n",
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"文本。\"}\n\n",
                 "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n"
             );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+            let split = split_inside(body, "🙂");
+            write_chunked_sse_response(
+                &mut stream,
+                &[&body.as_bytes()[..split], &body.as_bytes()[split..]],
             );
-            stream.write_all(response.as_bytes()).unwrap();
         });
 
         let provider = CodexOAuthLLMProvider::new(
@@ -2504,7 +2966,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(output, "最终文本。");
+        assert_eq!(output, "最终🙂文本。");
         server.join().unwrap();
         let _ = std::fs::remove_file(auth_path);
     }

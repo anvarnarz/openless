@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::coordinator_state::request_stop_during_starting_state;
 use crate::correction::apply_correction_rules;
-use crate::types::HotkeyMode;
+use crate::types::{CorrectionRule, HotkeyMode};
 
 use super::qa::handle_qa_option_edge;
 use super::resources::*;
@@ -12,6 +12,307 @@ use super::*;
 /// 同一个 hotkey 边沿之间的最小间隔。低于此阈值的连按整体作为误触丢弃 ——
 /// 避免微动开关回弹 / 用户手抖双击造成的空转写报错和 ASR session 抢资源。
 const HOTKEY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// 跑流式润色路径（opt-in，跨平台）。
+///
+/// 平台差异：
+/// - **macOS**：`switch_to_ascii` 切到 ABC 输入源（规避 CJK / 日文 IME 拦截 Unicode 事件），
+///   session 结束 `restore_input_source` 切回。`type_unicode_chunk` 走 CGEvent FFI。
+/// - **Windows**：`switch_to_ascii` 是 no-op（SendInput Unicode 绕过 TSF）；
+///   `type_unicode_chunk` 走 `SendInput(KEYEVENTF_UNICODE)`。
+/// - **Linux（实验）**：`switch_to_ascii` 是 no-op；`type_unicode_chunk` 走 enigo
+///   `Keyboard::text`。X11 / XTest 稳定，Wayland 看 compositor 给不给 libei 权限。
+///
+/// 通用流程：
+/// 1. `switch_to_ascii`（macOS）/ no-op（其他）；失败则降级回一次性 `polish_or_passthrough`。
+/// 2. 起一个 `spawn_blocking` 后台任务，从 mpsc 收 SSE delta，逐 delta 调
+///    `type_unicode_chunk` 模拟键盘事件落到光标处。串行有序，无竞态。
+/// 3. 调 `polish_or_passthrough_streaming`，`on_delta` 把 chunk 塞进 mpsc。
+/// 4. 流结束 / 失败 / 取消 → drop mpsc 发送端 → typer 任务 drain 完剩余 delta 退出 →
+///    `restore_input_source` 恢复用户原输入源（macOS 才有意义，其他平台 no-op）。
+/// 5. 返回 `(polished, polish_error, already_streamed)`：
+///    - 成功：`(text, None, true)` — 字符已经在屏幕上，调用方应当跳过 `inserter.insert`
+///    - 失败：`(raw_text, Some(reason), false)` — 流式过程出错，调用方走 raw 一次性兜底
+///    - 不支持：`run_streaming_polish` 内部直接调 `polish_or_passthrough` 透明降级
+///
+/// **不在流式路径里做**：`apply_chinese_script_preference` / `apply_correction_rules`
+/// 这两步在 v1 跳过 —— 字符已经一边流一边落出去了，不好回退。需要的话只能关 toggle 走
+/// 一次性路径。
+fn append_typed_prefix(typed_text: &mut String, delta: &str, typed_chars: usize) {
+    typed_text.extend(delta.chars().take(typed_chars));
+}
+
+fn finalize_dictation_text(
+    mut text: String,
+    already_streamed: bool,
+    translation_active: bool,
+    mode: PolishMode,
+    polish_failed: bool,
+    chinese_script_preference: crate::types::ChineseScriptPreference,
+    correction_rules: &[CorrectionRule],
+) -> String {
+    if already_streamed {
+        return text;
+    }
+
+    // 仅在“ASR 直出文本”场景做强制简繁收敛，避免误伤成功的翻译/常规 LLM 输出：
+    // - 非翻译模式：mode=Raw（本来就不走润色）或润色失败回退 raw
+    // - 翻译模式：仅翻译失败回退 raw 时才收敛
+    let should_force_script = if translation_active {
+        polish_failed
+    } else {
+        mode == PolishMode::Raw || polish_failed
+    };
+    if should_force_script {
+        text = apply_chinese_script_preference(&text, chinese_script_preference);
+    }
+
+    if correction_rules.is_empty() {
+        return text;
+    }
+
+    let corrected = apply_correction_rules(&text, correction_rules);
+    if corrected != text {
+        log::info!(
+            "[coord] correction rules adjusted final text ({} → {} chars)",
+            text.chars().count(),
+            corrected.chars().count()
+        );
+    }
+    corrected
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_streaming_polish(
+    inner: &Arc<Inner>,
+    raw: &RawTranscript,
+    mode: PolishMode,
+    hotwords: &[String],
+    working_languages: &[String],
+    chinese_script_preference: crate::types::ChineseScriptPreference,
+    output_language_preference: crate::types::OutputLanguagePreference,
+    llm_thinking_enabled: bool,
+    front_app: Option<&str>,
+    prior_turns: &[(String, String)],
+) -> (String, Option<String>, bool) {
+    log::info!(
+        "[coord] streaming_insert path ENTER (raw_chars={})",
+        raw.text.chars().count()
+    );
+
+    let app = inner.app.lock().clone();
+    let Some(app) = app else {
+        log::warn!("[coord] streaming_insert: no AppHandle in Inner; fall back to one-shot");
+        let (p, e) = polish_or_passthrough(
+            raw,
+            mode,
+            hotwords,
+            working_languages,
+            chinese_script_preference,
+            output_language_preference,
+            llm_thinking_enabled,
+            front_app,
+            prior_turns,
+        )
+        .await;
+        return (p, e, false);
+    };
+
+    // 1. 切到 ABC 输入源。失败则降级 —— 流式路径上 CJK IME 拦截不是可恢复错误。
+    log::info!("[coord] streaming_insert: switching input source to ABC");
+    let prev_ime = match crate::unicode_keystroke::switch_to_ascii(&app).await {
+        Ok(prev) => {
+            log::info!(
+                "[coord] streaming_insert: switched to ABC (had_previous={})",
+                prev.is_some()
+            );
+            prev
+        }
+        Err(e) => {
+            log::warn!(
+                "[coord] streaming_insert: switch_to_ascii failed: {e}; fall back to one-shot"
+            );
+            let (p, err) = polish_or_passthrough(
+                raw,
+                mode,
+                hotwords,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                llm_thinking_enabled,
+                front_app,
+                prior_turns,
+            )
+            .await;
+            return (p, err, false);
+        }
+    };
+
+    // 2. 起 typer 后台任务：从 mpsc 收 delta，串行调 type_unicode_chunk。
+    // 同时累积 typed_text：屏幕上真正落字的内容，用于（a）SSE 中途失败时让 history
+    // 与用户实际看到的内容一致；（b）pr-agent #412 反馈 \"saved output diverges
+    // from what the user actually sees\"。
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let typer_handle = tokio::task::spawn_blocking(move || {
+        let mut rx = rx;
+        let mut typed_text = String::new();
+        let mut first_failure: Option<String> = None;
+        while let Some(delta) = rx.blocking_recv() {
+            if first_failure.is_some() {
+                // 一旦类型链路出错（如 Secure Input 启用），后续 delta 全部丢弃，但仍
+                // 把 mpsc drain 完，避免发送端阻塞。
+                continue;
+            }
+            match crate::unicode_keystroke::type_unicode_chunk(&delta) {
+                Ok(typed_chars) => {
+                    append_typed_prefix(&mut typed_text, &delta, typed_chars);
+                }
+                Err(e) => {
+                    let typed_chars = e.typed_chars();
+                    append_typed_prefix(&mut typed_text, &delta, typed_chars);
+                    log::error!(
+                        "[coord] streaming_insert: type_unicode_chunk failed at typed={} chars: {e}; \
+                         dropping remaining deltas",
+                        typed_text.chars().count()
+                    );
+                    first_failure = Some(e.to_string());
+                }
+            }
+        }
+        (typed_text, first_failure)
+    });
+
+    // 3. 调流式润色，on_delta 塞 mpsc；should_cancel 检查 dictation 取消旗。
+    let inner_for_cancel = Arc::clone(inner);
+    let should_cancel = move || inner_for_cancel.state.lock().cancelled;
+    let outcome = super::polish_or_passthrough_streaming(
+        raw,
+        mode,
+        hotwords,
+        working_languages,
+        chinese_script_preference,
+        output_language_preference,
+        llm_thinking_enabled,
+        front_app,
+        prior_turns,
+        move |delta: &str| {
+            let _ = tx.send(delta.to_string());
+        },
+        should_cancel,
+    )
+    .await;
+    // tx 已经被 move 进 on_delta 闭包；闭包随 polish_or_passthrough_streaming 返回
+    // 而 drop，typer 那侧 blocking_recv 拿到 None 自然退出。
+
+    // 4. 等 typer 把缓冲 drain 完，拿到实际落字的全文 + 第一条失败原因。
+    let (typed_text, typer_failure) = typer_handle.await.unwrap_or_else(|e| {
+        log::error!("[coord] streaming_insert: typer task join failed: {e}");
+        (String::new(), Some(format!("typer join: {e}")))
+    });
+    let typed_chars = typed_text.chars().count();
+    log::info!("[coord] streaming_insert: typer drained, typed {typed_chars} chars");
+
+    // 5. 无论流是否成功，都恢复用户原输入源。
+    log::info!("[coord] streaming_insert: restoring input source");
+    if let Err(e) = crate::unicode_keystroke::restore_input_source(&app, prev_ime).await {
+        log::warn!("[coord] streaming_insert: restore_input_source failed: {e}");
+    } else {
+        log::info!("[coord] streaming_insert: input source restored");
+    }
+
+    // 6. 把 outcome 翻译成 (polished, polish_error, already_streamed)。
+    match outcome {
+        super::StreamingPolishOutcome::Streamed(text) => {
+            log::info!(
+                "[coord] streaming_insert SUCCESS: polished_chars={} typed_chars={} typer_err={:?}",
+                text.chars().count(),
+                typed_chars,
+                typer_failure
+            );
+            // 边界 case：polish 成功但 typer 在第一字就失败（最常见：session 开始时
+            // 已处于 Secure Input；或 SendInput / enigo 拒绝）。屏幕上一字未见，
+            // already_streamed=true 会让上层跳过 inserter，最终用户看不到任何内容。
+            // 这里显式回退到一次性兜底，让正常 inserter 路径写出 polish 结果。
+            // pr-agent #412 反馈 \"Missing fallback\"。
+            if typed_chars == 0 {
+                if let Some(reason) = typer_failure {
+                    log::warn!(
+                        "[coord] streaming_insert: zero chars typed despite polish success ({reason}); falling back to one-shot inserter"
+                    );
+                    return (text, Some(reason), false);
+                }
+            }
+            // 先确定 final_text —— typer 中途失败时屏幕只有 typed_text 这一段，
+            // history 记完整 polish 反而会让用户复盘困惑。让 history / clipboard /
+            // 后续逻辑统统用 final_text，三处保持一致。
+            // pr-agent #412 反馈 \"Clipboard Mismatch\"：之前先写 text 到剪贴板再
+            // 决定 typer 是否中途失败，导致 Cmd+V 粘出用户屏幕上没见过的内容。
+            let (final_text, polish_err) = match typer_failure {
+                Some(e) => (typed_text, Some(format!("typing partially failed: {e}"))),
+                None => (text, None),
+            };
+            // 把 final_text 写回剪贴板（默认 on，可关）。一次性路径天然走剪贴板，
+            // 开关默认对齐一次性行为，让 Cmd+V 重复粘贴可用。
+            if inner.prefs.get().streaming_insert_save_clipboard {
+                match arboard::Clipboard::new() {
+                    Ok(mut cb) => match cb.set_text(final_text.clone()) {
+                        Ok(()) => log::info!(
+                            "[coord] streaming_insert: final text written to clipboard ({} chars)",
+                            final_text.chars().count()
+                        ),
+                        Err(e) => {
+                            log::warn!("[coord] streaming_insert: clipboard set_text failed: {e}")
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("[coord] streaming_insert: clipboard handle init failed: {e}")
+                    }
+                }
+            } else {
+                log::info!("[coord] streaming_insert: clipboard save skipped (pref off)");
+            }
+            (final_text, polish_err, true)
+        }
+        super::StreamingPolishOutcome::UnsupportedFallback => {
+            log::info!(
+                "[coord] streaming_insert: dispatch reported unsupported, fall back to one-shot"
+            );
+            let (p, e) = polish_or_passthrough(
+                raw,
+                mode,
+                hotwords,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                llm_thinking_enabled,
+                front_app,
+                prior_turns,
+            )
+            .await;
+            (p, e, false)
+        }
+        super::StreamingPolishOutcome::Failed(reason) => {
+            log::warn!(
+                "[coord] streaming_insert FAILED: {reason}; typed {typed_chars} chars before failure"
+            );
+            // 流式失败但已经流了一部分 chars：用户屏幕上有半截 polish。history 应当
+            // 跟屏幕一致 —— 记 typed_text 而不是 raw.text，否则保存内容跟用户看见的
+            // 内容会分叉（pr-agent #412 \"Wrong final text\" 反馈）。
+            // 一字都没流时 typed_text 是空串，回到 raw 一次性兜底。
+            if typed_chars > 0 {
+                (
+                    typed_text,
+                    Some(format!(
+                        "streaming polish failed mid-stream after {typed_chars} chars: {reason}"
+                    )),
+                    true,
+                )
+            } else {
+                (raw.text.clone(), Some(reason), false)
+            }
+        }
+    }
+}
 
 pub(super) async fn handle_pressed_edge(inner: &Arc<Inner>) {
     let was_held = inner.hotkey_trigger_held.swap(true, Ordering::SeqCst);
@@ -990,14 +1291,22 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     } else {
         Vec::new()
     };
-    let (polished, polish_error) = if translation_active {
+    // 流式插入 opt-in 路径：开关打开 + 非翻译 + 非 Raw 模式 → 进入流式分支。
+    // 任何不满足都走原一次性 polish_or_passthrough 路径，行为跟历史完全一致。
+    let streaming_eligible =
+        prefs.streaming_insert && !translation_active && mode != PolishMode::Raw;
+    log::info!(
+        "[coord] polish dispatch: translation={translation_active} mode={mode:?} streaming_eligible={streaming_eligible}"
+    );
+
+    let (polished, polish_error, already_streamed) = if translation_active {
         log::info!(
             "[coord] translation mode → target=\u{300C}{}\u{300D} working={:?} front_app={:?}",
             translation_target,
             working_languages,
             front_app
         );
-        translate_or_passthrough(
+        let (p, e) = translate_or_passthrough(
             &raw,
             &translation_target,
             &working_languages,
@@ -1006,9 +1315,11 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             llm_thinking_enabled,
             front_app.as_deref(),
         )
-        .await
-    } else {
-        polish_or_passthrough(
+        .await;
+        (p, e, false)
+    } else if streaming_eligible {
+        run_streaming_polish(
+            inner,
             &raw,
             mode,
             &hotword_strs,
@@ -1020,42 +1331,43 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             &prior_turns,
         )
         .await
+    } else {
+        let (p, e) = polish_or_passthrough(
+            &raw,
+            mode,
+            &hotword_strs,
+            &working_languages,
+            chinese_script_preference,
+            output_language_preference,
+            llm_thinking_enabled,
+            front_app.as_deref(),
+            &prior_turns,
+        )
+        .await;
+        (p, e, false)
     };
 
-    // 仅在“ASR 直出文本”场景做强制简繁收敛，避免误伤成功的翻译/常规 LLM 输出：
-    // - 非翻译模式：mode=Raw（本来就不走润色）或润色失败回退 raw
-    // - 翻译模式：仅翻译失败回退 raw 时才收敛
-    let should_force_script = if translation_active {
-        polish_error.is_some()
-    } else {
-        mode == PolishMode::Raw || polish_error.is_some()
-    };
-    let polished = if should_force_script {
-        apply_chinese_script_preference(&polished, chinese_script_preference)
-    } else {
-        polished
-    };
-    let polished = if correction_rules.is_empty() {
-        polished
-    } else {
-        let corrected = apply_correction_rules(&polished, &correction_rules);
-        if corrected != polished {
-            log::info!(
-                "[coord] correction rules adjusted final text ({} → {} chars)",
-                polished.chars().count(),
-                corrected.chars().count()
-            );
-        }
-        corrected
-    };
+    let polished = finalize_dictation_text(
+        polished,
+        already_streamed,
+        translation_active,
+        mode,
+        polish_error.is_some(),
+        chinese_script_preference,
+        &correction_rules,
+    );
 
     // 原子化最后一次 cancel 检查 + 转 Inserting：
     // 在同一 lock 内决定「丢弃」还是「进入 Inserting」。一旦设到 Inserting，
     // cancel_session 就拒绝介入（Cmd+V 已发出，撤销不掉）。这是 audit HIGH #2 的修复，
     // 之前 check 与 inserter.insert 之间有窗口期。
+    //
+    // 流式路径例外：`already_streamed = true` 表示字符已经一边流一边落到光标了，
+    // 撤销不掉。即使 cancel 旗在中途被立起来，也只能尊重「已经发生」的事实，进入
+    // Inserting 状态完成 history / vocab 等收尾工作。
     let proceed_to_insert = {
         let mut state = inner.state.lock();
-        if state.cancelled {
+        if state.cancelled && !already_streamed {
             state.phase = SessionPhase::Idle;
             false
         } else {
@@ -1078,7 +1390,15 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let restore_clipboard = prefs.restore_clipboard_after_paste;
     let allow_non_tsf_insertion_fallback = prefs.allow_non_tsf_insertion_fallback;
     let paste_shortcut = prefs.paste_shortcut;
-    let status = if focus_ready_for_paste {
+    // 流式路径下，字符已经通过 Unicode keystroke 落到光标处，跳过 inserter.insert。
+    let status = if already_streamed {
+        log::info!(
+            "[coord] insertion skipped: {} chars already streamed via unicode_keystroke (polish_error={:?})",
+            polished.chars().count(),
+            polish_error
+        );
+        InsertStatus::Inserted
+    } else if focus_ready_for_paste {
         #[cfg(target_os = "windows")]
         {
             let ime_target = capture_ime_submit_target();
@@ -1245,4 +1565,70 @@ pub(super) fn cancel_session(inner: &Arc<Inner>) {
     emit_capsule(inner, CapsuleState::Cancelled, 0.0, 0, None, None);
     log::info!("[coord] session cancelled (was {:?})", decision.phase);
     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_typed_prefix, finalize_dictation_text};
+    use crate::types::PolishMode;
+
+    #[test]
+    fn append_typed_prefix_truncates_by_chars_not_bytes() {
+        let mut typed = String::from("已");
+        append_typed_prefix(&mut typed, "你好🙂abc", 3);
+        assert_eq!(typed, "已你好🙂");
+    }
+
+    #[test]
+    fn append_typed_prefix_ignores_overlarge_count() {
+        let mut typed = String::new();
+        append_typed_prefix(&mut typed, "好", 99);
+        assert_eq!(typed, "好");
+    }
+
+    #[test]
+    fn streamed_text_skips_mutating_final_postprocess() {
+        let rules = vec![crate::types::CorrectionRule {
+            id: "r1".into(),
+            pattern: "错词".into(),
+            replacement: "正词".into(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+
+        let text = finalize_dictation_text(
+            "錯詞".to_string(),
+            true,
+            false,
+            PolishMode::Raw,
+            true,
+            crate::types::ChineseScriptPreference::Simplified,
+            &rules,
+        );
+
+        assert_eq!(text, "錯詞");
+    }
+
+    #[test]
+    fn non_streamed_text_still_applies_final_postprocess() {
+        let rules = vec![crate::types::CorrectionRule {
+            id: "r1".into(),
+            pattern: "错词".into(),
+            replacement: "正词".into(),
+            enabled: true,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+
+        let text = finalize_dictation_text(
+            "錯詞".to_string(),
+            false,
+            false,
+            PolishMode::Raw,
+            false,
+            crate::types::ChineseScriptPreference::Simplified,
+            &rules,
+        );
+
+        assert_eq!(text, "正词");
+    }
 }

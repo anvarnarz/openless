@@ -1,6 +1,4 @@
-import { useState, type CSSProperties, type ReactNode } from 'react';
-import { useTranslation } from 'react-i18next';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { type CSSProperties, type ReactNode } from 'react';
 
 export type OS = 'mac' | 'win' | 'linux';
 
@@ -18,21 +16,7 @@ export function detectOS(): OS {
 
 const MAC_TITLEBAR_HEIGHT = 28;
 const MAC_SYSTEM_CONTROLS_RESERVED_WIDTH = 76;
-export const WIN_TITLEBAR_HEIGHT = 36;
-export const WIN_WINDOW_RADIUS = 10;
-export const WIN_CONSOLE_RADIUS = 10;
-const WIN_RESIZE_EDGE = 6;
-const WIN_RESIZE_CORNER = 14;
-
-type ResizeDirection =
-  | 'East'
-  | 'North'
-  | 'NorthEast'
-  | 'NorthWest'
-  | 'South'
-  | 'SouthEast'
-  | 'SouthWest'
-  | 'West';
+const WIN_CONSOLE_RADIUS = 10;
 
 interface WindowChromeProps {
   os?: OS;
@@ -43,39 +27,42 @@ interface WindowChromeProps {
 
 export function WindowChrome({
   os = 'mac',
-  title = 'OpenLess',
   children,
   height = 800,
 }: WindowChromeProps) {
-  const shellRadius = os === 'mac' ? 0 : os === 'win' ? WIN_WINDOW_RADIUS : 14;
+  // Windows 下交还原生外壳（decorations:true）：外层不画圆角 / 边框 / 阴影 / 标题栏，
+  // 避免与原生窗口的角和关闭按钮重叠。内层卡片保留 10px 圆角，跟整体设计对齐。
+  const shellRadius = os === 'mac' ? 0 : os === 'win' ? 0 : 14;
   const consoleRadius = os === 'mac' ? 20 : os === 'win' ? WIN_CONSOLE_RADIUS : 14;
+  const titlebarHeight = os === 'mac' ? MAC_TITLEBAR_HEIGHT : 0;
+
+  // 两个平台用同一份半透明玻璃 background + backdropFilter，让 sidebar 透明地坐在
+  // 磨砂底板上时有可见的玻璃感。
+  // Windows: Tauri transparent:true + lib.rs apply_mica 提供 Win11 Mica 透出来；
+  // macOS: NSVisualEffectView 提供材质。
+  // alpha 0.92：和原生 Win11 caption（lib.rs 设为 rgb(245,245,247)）色差最小，玻璃感仍可见。
+  const background = `
+    radial-gradient(120% 80% at 0% 0%, rgba(255,255,255,0.55) 0%, rgba(255,255,255,0) 60%),
+    radial-gradient(100% 70% at 100% 100%, rgba(37,99,235,0.07) 0%, rgba(37,99,235,0) 55%),
+    linear-gradient(180deg, rgba(245,245,247,0.92) 0%, rgba(232,232,236,0.92) 100%)
+  `;
 
   return (
     <div
       style={{
         '--ol-window-shell-radius': `${shellRadius}px`,
         '--ol-window-console-radius': `${consoleRadius}px`,
-        '--ol-window-titlebar-height': `${os === 'mac' ? MAC_TITLEBAR_HEIGHT : WIN_TITLEBAR_HEIGHT}px`,
+        '--ol-window-titlebar-height': `${titlebarHeight}px`,
         width: '100%',
         height,
         position: 'relative',
         borderRadius: 'var(--ol-window-shell-radius)',
-        boxShadow: os === 'win'
-          ? '0 22px 54px -28px rgba(15, 17, 22, 0.38), 0 10px 30px -20px rgba(15, 17, 22, 0.22), 0 0 0 0.5px rgba(0, 0, 0, 0.10)'
-          : 'var(--ol-shadow-xl)',
+        boxShadow: os === 'win' ? 'none' : 'var(--ol-shadow-xl)',
         overflow: 'hidden',
         display: 'flex',
         flexDirection: 'column',
-        border: os === 'mac'
-          ? 'none'
-          : os === 'win'
-            ? '1px solid rgba(255,255,255,0.18)'
-            : '0.5px solid rgba(0,0,0,.10)',
-        background: `
-          radial-gradient(120% 80% at 0% 0%, rgba(255,255,255,0.7) 0%, rgba(255,255,255,0) 60%),
-          radial-gradient(100% 70% at 100% 100%, rgba(37,99,235,0.07) 0%, rgba(37,99,235,0) 55%),
-          linear-gradient(180deg, rgba(245,245,247,0.92) 0%, rgba(232,232,236,0.92) 100%)
-        `,
+        border: os === 'win' ? 'none' : os === 'mac' ? 'none' : '0.5px solid rgba(0,0,0,.10)',
+        background,
         backdropFilter: 'blur(var(--ol-glass-blur-strong)) saturate(190%)',
         WebkitBackdropFilter: 'blur(var(--ol-glass-blur-strong)) saturate(190%)',
         animation: os === 'win' ? undefined : 'ol-window-enter 0.42s var(--ol-motion-spring) both',
@@ -83,8 +70,6 @@ export function WindowChrome({
         willChange: 'opacity, transform, filter',
       } as CSSProperties}
     >
-      {os === 'win' && <WinTitleBar title={title} />}
-      {os === 'win' && <WindowsResizeHandles />}
       {os === 'mac' && (
         <div
           data-tauri-drag-region
@@ -104,154 +89,3 @@ export function WindowChrome({
     </div>
   );
 }
-
-interface WinTitleBarProps {
-  title: string;
-}
-
-function WinTitleBar({ title }: WinTitleBarProps) {
-  const { t } = useTranslation();
-  return (
-    <div
-      style={{
-        height: WIN_TITLEBAR_HEIGHT,
-        flexShrink: 0,
-        display: 'flex',
-        alignItems: 'stretch',
-        position: 'relative',
-        zIndex: 70,
-        borderBottom: '0.5px solid rgba(0, 0, 0, 0.08)',
-        background: 'linear-gradient(180deg, rgba(255,255,255,0.20) 0%, rgba(255,255,255,0.08) 100%)',
-      }}
-    >
-      <div
-        data-tauri-drag-region
-        style={{ flex: 1, display: 'flex', alignItems: 'center', padding: '0 14px', gap: 10 }}
-      >
-        <img src="AppIcon.png" alt="" style={{ width: 14, height: 14, borderRadius: 3 }} />
-        <span style={{ fontSize: 12, color: 'var(--ol-ink-3)', fontWeight: 500 }}>{title}</span>
-      </div>
-      <div style={{ display: 'flex', pointerEvents: 'auto' }}>
-        <WinTitleButton title={t('windowChrome.minimize')} action="minimize">
-          <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" strokeWidth="1" /></svg>
-        </WinTitleButton>
-        <WinTitleButton title={t('windowChrome.maximize')} action="toggleMaximize">
-          <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" stroke="currentColor" strokeWidth="1" fill="none" /></svg>
-        </WinTitleButton>
-        <WinTitleButton title={t('windowChrome.close')} action="close" tone="danger">
-          <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 0L10 10M10 0L0 10" stroke="currentColor" strokeWidth="1" /></svg>
-        </WinTitleButton>
-      </div>
-    </div>
-  );
-}
-
-function WindowsResizeHandles() {
-  const handles: Array<{
-    direction: ResizeDirection;
-    cursor: CSSProperties['cursor'];
-    style: CSSProperties;
-  }> = [
-    { direction: 'North', cursor: 'ns-resize', style: { top: 0, left: WIN_RESIZE_CORNER, right: WIN_RESIZE_CORNER, height: WIN_RESIZE_EDGE } },
-    { direction: 'South', cursor: 'ns-resize', style: { bottom: 0, left: WIN_RESIZE_CORNER, right: WIN_RESIZE_CORNER, height: WIN_RESIZE_EDGE } },
-    { direction: 'West', cursor: 'ew-resize', style: { top: WIN_RESIZE_CORNER, bottom: WIN_RESIZE_CORNER, left: 0, width: WIN_RESIZE_EDGE } },
-    { direction: 'East', cursor: 'ew-resize', style: { top: WIN_RESIZE_CORNER, bottom: WIN_RESIZE_CORNER, right: 0, width: WIN_RESIZE_EDGE } },
-    { direction: 'NorthWest', cursor: 'nwse-resize', style: { top: 0, left: 0, width: WIN_RESIZE_CORNER, height: WIN_RESIZE_CORNER } },
-    { direction: 'NorthEast', cursor: 'nesw-resize', style: { top: 0, right: 0, width: WIN_RESIZE_CORNER, height: WIN_RESIZE_CORNER } },
-    { direction: 'SouthWest', cursor: 'nesw-resize', style: { bottom: 0, left: 0, width: WIN_RESIZE_CORNER, height: WIN_RESIZE_CORNER } },
-    { direction: 'SouthEast', cursor: 'nwse-resize', style: { bottom: 0, right: 0, width: WIN_RESIZE_CORNER, height: WIN_RESIZE_CORNER } },
-  ];
-
-  return (
-    <div aria-hidden style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 60 }}>
-      {handles.map(handle => (
-        <div
-          key={handle.direction}
-          onMouseDown={event => {
-            if (event.button !== 0) return;
-            event.preventDefault();
-            event.stopPropagation();
-            void startResizeDragging(handle.direction);
-          }}
-          style={{
-            position: 'absolute',
-            pointerEvents: 'auto',
-            cursor: handle.cursor,
-            ...handle.style,
-          }}
-        />
-      ))}
-    </div>
-  );
-}
-
-interface WinTitleButtonProps {
-  title: string;
-  action: 'minimize' | 'toggleMaximize' | 'close';
-  tone?: 'default' | 'danger';
-  children: ReactNode;
-}
-
-function WinTitleButton({ title, action, tone = 'default', children }: WinTitleButtonProps) {
-  const [hovered, setHovered] = useState(false);
-  const [pressed, setPressed] = useState(false);
-  const danger = tone === 'danger';
-  const background = pressed
-    ? danger ? '#c42b1c' : 'rgba(0, 0, 0, 0.12)'
-    : hovered ? danger ? '#e81123' : 'rgba(0, 0, 0, 0.08)'
-      : 'transparent';
-  const color = danger && (hovered || pressed) ? '#fff' : 'var(--ol-ink-3)';
-
-  return (
-    <button
-      style={{ ...winBtnStyle, background, color }}
-      title={title}
-      onClick={() => runWindowsWindowAction(action)}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => {
-        setHovered(false);
-        setPressed(false);
-      }}
-      onMouseDown={() => setPressed(true)}
-      onMouseUp={() => setPressed(false)}
-    >
-      {children}
-    </button>
-  );
-}
-
-async function startResizeDragging(direction: ResizeDirection) {
-  try {
-    await getCurrentWindow().startResizeDragging(direction);
-  } catch (error) {
-    console.warn(`[window] Windows resize ${direction} failed`, error);
-  }
-}
-
-async function runWindowsWindowAction(action: 'minimize' | 'toggleMaximize' | 'close') {
-  try {
-    const currentWindow = getCurrentWindow();
-    if (action === 'minimize') {
-      await currentWindow.minimize();
-    } else if (action === 'toggleMaximize') {
-      await currentWindow.toggleMaximize();
-    } else {
-      await currentWindow.close();
-    }
-  } catch (error) {
-    console.warn(`[window] Windows title button ${action} failed`, error);
-  }
-}
-
-const winBtnStyle: CSSProperties = {
-  width: 46,
-  height: '100%',
-  border: 0,
-  background: 'transparent',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  color: 'var(--ol-ink-3)',
-  cursor: 'default',
-  transition: 'background 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick)',
-};

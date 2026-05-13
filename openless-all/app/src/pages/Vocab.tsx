@@ -16,7 +16,7 @@ import {
 } from '../lib/ipc';
 import type { CorrectionRule, DictionaryEntry, VocabPreset } from '../lib/types';
 import { DEFAULT_VOCAB_PRESETS, loadVocabPresets, persistVocabPresets } from '../lib/vocabPresets';
-import { Btn, Card, PageHeader } from './_atoms';
+import { Btn, Card, Collapsible, PageHeader } from './_atoms';
 
 const NEW_PRESET_DRAFT_ID = '__new__';
 const NUM_TOKEN = '{num}';
@@ -267,9 +267,12 @@ export function Vocab() {
         }
       />
       <Card padding={0}>
-        <div style={{ padding: 18, borderBottom: '0.5px solid var(--ol-line)' }}>
+        <Collapsible
+          embedded
+          title={t('vocab.presets.title')}
+          desc={t('vocab.presets.tip')}
+        >
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            <strong style={{ fontSize: 12 }}>{t('vocab.presets.title')}</strong>
             {presets.map(p => (
               <button
                 key={p.id}
@@ -288,7 +291,6 @@ export function Vocab() {
             <Btn size="sm" variant="ghost" onClick={createPreset}>{t('vocab.presets.create')}</Btn>
             <Btn size="sm" variant="primary" onClick={applySelectedPresets}>{t('vocab.presets.apply')}</Btn>
           </div>
-          <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 10 }}>{t('vocab.presets.tip')}</div>
           {editingPresetId && (
             <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>
               <input value={presetNameDraft} onChange={e => setPresetNameDraft(e.target.value)} placeholder={t('vocab.presets.namePlaceholder')} />
@@ -300,7 +302,7 @@ export function Vocab() {
             </div>
           )}
           {!editingPresetId && presets.length > 0 && (
-            <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {presets.map(p => (
                 <Btn key={`${p.id}-edit`} size="sm" variant="ghost" onClick={() => startEditPreset(p)}>
                   {t('vocab.presets.edit', { name: p.name })}
@@ -308,13 +310,13 @@ export function Vocab() {
               ))}
             </div>
           )}
-        </div>
-        <div style={{ padding: 18, borderBottom: '0.5px solid var(--ol-line)' }}>
+        </Collapsible>
+        <Collapsible
+          embedded
+          title={t('vocab.corrections.title')}
+          desc={t('vocab.corrections.tip')}
+        >
           <div style={{ display: 'grid', gap: 10 }}>
-            <div>
-              <strong style={{ fontSize: 12 }}>{t('vocab.corrections.title')}</strong>
-              <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 6 }}>{t('vocab.corrections.tip')}</div>
-            </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto minmax(0, 1fr) auto', gap: 8, alignItems: 'center' }}>
               <input
                 value={rulePatternDraft}
@@ -345,8 +347,13 @@ export function Vocab() {
               ))}
             </div>
           </div>
-        </div>
-        <div style={{ padding: 18, borderBottom: '0.5px solid var(--ol-line)' }}>
+        </Collapsible>
+        <Collapsible
+          embedded
+          defaultOpen
+          title={t('vocab.sectionTitle')}
+          desc={t('vocab.tip')}
+        >
           <div style={{ display: 'flex', gap: 8 }}>
             <input
               ref={inputRef}
@@ -363,26 +370,23 @@ export function Vocab() {
             />
             <Btn variant="primary" icon="plus" onClick={onAdd}>{t('common.add')}</Btn>
           </div>
-          <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 10 }}>
-            {t('vocab.tip')}
+          <div style={{ marginTop: 12, display: 'flex', flexWrap: 'wrap', gap: 8, minHeight: 80 }}>
+            {loading && <div style={{ fontSize: 12, color: 'var(--ol-ink-4)' }}>{t('common.loading')}</div>}
+            {!loading && error && (
+              <div style={{ fontSize: 12, color: 'var(--ol-err)', lineHeight: 1.6 }}>
+                {t('vocab.loadFailed', { err: error })}
+              </div>
+            )}
+            {!loading && !error && entries.length === 0 && (
+              <div style={{ fontSize: 12, color: 'var(--ol-ink-4)' }}>
+                {t('vocab.empty')}
+              </div>
+            )}
+            {!error && entries.map(e => (
+              <VocabChip key={e.id} entry={e} onRemove={() => onRemove(e.id)} onToggle={() => onToggle(e)} />
+            ))}
           </div>
-        </div>
-        <div style={{ padding: 18, display: 'flex', flexWrap: 'wrap', gap: 8, minHeight: 80 }}>
-          {loading && <div style={{ fontSize: 12, color: 'var(--ol-ink-4)' }}>{t('common.loading')}</div>}
-          {!loading && error && (
-            <div style={{ fontSize: 12, color: 'var(--ol-err)', lineHeight: 1.6 }}>
-              {t('vocab.loadFailed', { err: error })}
-            </div>
-          )}
-          {!loading && !error && entries.length === 0 && (
-            <div style={{ fontSize: 12, color: 'var(--ol-ink-4)' }}>
-              {t('vocab.empty')}
-            </div>
-          )}
-          {!error && entries.map(e => (
-            <VocabChip key={e.id} entry={e} onRemove={() => onRemove(e.id)} onToggle={() => onToggle(e)} />
-          ))}
-        </div>
+        </Collapsible>
       </Card>
       <style>{`
         @keyframes ol-chip-in {
@@ -446,6 +450,10 @@ function VocabChip({ entry, onRemove, onToggle }: VocabChipProps) {
   return (
     <span
       style={{
+        // 父 flex 容器 minHeight: 80 会让 flex item 在 align-self 默认 stretch 下被拉到
+        // 80px 高，chip borderRadius: 999 把高度变大渲染成"超大椭圆"。alignSelf:flex-start
+        // 阻止拉伸，chip 始终保持 content 高度。
+        alignSelf: 'flex-start',
         display: 'inline-flex', alignItems: 'center', gap: 6,
         padding: '5px 10px 5px 12px',
         borderRadius: 999,

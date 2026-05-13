@@ -51,6 +51,8 @@ const previousPrefs: UserPreferences = {
   polishContextWindowMinutes: 5,
   startMinimized: false,
   updateChannel: 'stable',
+  streamingInsert: false,
+  streamingInsertSaveClipboard: true,
 };
 
 const nextPrefs: UserPreferences = {

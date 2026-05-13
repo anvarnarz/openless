@@ -299,6 +299,18 @@ pub fn get_hotkey_capability(coord: CoordinatorState<'_>) -> HotkeyCapability {
     coord.hotkey_capability()
 }
 
+/// Pull-style 查询：当前是否处于 Linux/Wayland session（rdev 不可用、需要走 CLI 路径）。
+/// 前端 RecordingSection mount 时调一次拿状态，直接渲染 callout。
+///
+/// 用 pull 而不是单纯依赖 ready-time 的 `wayland_cli_mode` event：Settings 模态是
+/// 条件渲染（用户首次打开 Settings 才 mount RecordingSection），但 emit 发生在 setup
+/// 末尾——一次性 event 不缓冲也不 replay，listener 99% 情况下错过事件 → callout
+/// 永远不显示。XDG_SESSION_TYPE 本身在进程生命周期内不会变，多次调用结果一致。
+#[tauri::command]
+pub fn is_wayland_cli_mode() -> bool {
+    crate::hotkey::is_wayland_session()
+}
+
 #[tauri::command]
 pub fn set_shortcut_recording_active(coord: CoordinatorState<'_>, active: bool) {
     coord.set_shortcut_recording_active(active);

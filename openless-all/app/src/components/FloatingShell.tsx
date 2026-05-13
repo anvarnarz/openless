@@ -257,14 +257,17 @@ function FloatingShellBody({ os, initialTab, initialSettings }: { os: OS; initia
           <div style={{ flex: 1 }} />
         </aside>
 
-        {/* Main content — inset white card sitting on the frosted backplate.
-            内卡圆角与外层窗口（WindowChrome 20/14）对齐，避免视觉上"两个不一致的圆角"。 */}
+        {/* Main content — v1.3.1-8 用户希望"sidebar / main panel / caption 三处玻璃统一"。
+            从 var(--ol-surface) 不透明白底 改成半透明白 + backdrop-filter，跟 sidebar
+            一起坐在 WindowChrome 的磨砂底板上，整体一块连续玻璃。 */}
         <div style={{ flex: 1, minWidth: 0, padding: '4px 8px 6px 0', display: 'flex' }}>
           <main
             style={{
               flex: 1, minWidth: 0,
               overflow: 'hidden',
-              background: 'var(--ol-surface)',
+              background: 'rgba(255, 255, 255, 0.62)',
+              backdropFilter: 'blur(18px) saturate(170%)',
+              WebkitBackdropFilter: 'blur(18px) saturate(170%)',
               borderRadius: 'var(--ol-window-console-radius)',
               border: '0.5px solid rgba(0,0,0,0.06)',
               boxShadow: '0 1px 0 rgba(255,255,255,0.8) inset, 0 8px 24px -12px rgba(15,17,22,0.10), 0 2px 6px -2px rgba(15,17,22,0.06)',

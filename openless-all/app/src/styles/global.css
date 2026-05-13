@@ -25,6 +25,35 @@ button {
   background: transparent;
   color: inherit;
   padding: 0;
+  /* Windows Chromium / WebView2 默认 user-agent style 会给 <button> 加 OS-native
+     appearance（outset 边框 + 内阴影）、min-width / min-height（让 button 至少容下
+     系统外观）、:focus 时的实线 outline。这些在 Vocab 词条这种嵌套 button 上叠加
+     起来变成一圈灰色"大圈"。macOS WKWebView 处理较弱所以看不出来。一次性清掉。
+     键盘焦点指示统一走 .ol-focus-ring + :focus-visible 走 box-shadow（不受 outline:0 影响）。 */
+  appearance: none;
+  -webkit-appearance: none;
+  outline: none;
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+@keyframes ol-select-pop {
+  from { opacity: 0; transform: translateY(-4px) scale(.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* SelectLite popover 关闭动画 —— 反向收缩 + 淡出 + 上移，跟入场对偶。 */
+@keyframes ol-select-pop-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(-4px) scale(.98); }
+}
+
+/* 键盘焦点指示：鼠标点击 (:focus) 不显示，键盘 Tab (:focus-visible) 才显示。
+   用 box-shadow 而非 outline 是因为组件内联 style 可能用 outline:none
+   把默认 ring 干掉，box-shadow 不受影响仍能上色。配合 pr-agent #407 的 a11y 要求。 */
+.ol-focus-ring:focus-visible {
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.45);
 }
 
 input, textarea {

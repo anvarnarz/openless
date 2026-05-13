@@ -2,7 +2,7 @@
 // Ported verbatim from design_handoff_openless/pages.jsx (PageHeader, Card,
 // Pill, Btn). Inline styles preserved 1:1.
 
-import type { CSSProperties, ReactNode } from 'react';
+import { useState, type CSSProperties, type ReactNode } from 'react';
 import { Icon } from '../components/Icon';
 
 interface PageHeaderProps {
@@ -141,5 +141,109 @@ export function Btn({ children, variant = 'ghost', size = 'md', icon, style, onC
       {icon && <Icon name={icon} size={13} />}
       {children}
     </button>
+  );
+}
+
+interface CollapsibleProps {
+  /// 标题行内容（短文案，居左）。
+  title: ReactNode;
+  /// 可选的副标题 / 描述（小字，居标题下方）。
+  desc?: ReactNode;
+  /// 默认是否展开。默认 false（折叠，符合"默认只显示标题 + 右箭头"语义）。
+  defaultOpen?: boolean;
+  /// 嵌在 Card padding=0 容器里时设为 true：移除上下 margin，仅靠 Card 的 borderBottom 分割。
+  embedded?: boolean;
+  children: ReactNode;
+}
+
+/// 折叠栏：默认收起，标题行右侧显示一个 `›` 箭头，点击切换展开/收起。展开时箭头
+/// 旋转 90°。内容区域用 `grid-template-rows: 0fr ↔ 1fr` 过渡——浏览器把 `1fr`
+/// 解析为内容实际高度，过渡到真实高度，避免 max-height 固定大值时短内容也走完
+/// 整段动画 / 短内容关闭时延迟生效的"卡卡"感。要求 Chromium 117+（Tauri 自带），
+/// 现代版本完全支持。
+///
+/// `embedded=true`：嵌在 `<Card padding={0}>` 里、与其他 Collapsible 共享一张 Card 时使用，
+/// 底部加一道 0.5px 分隔。
+/// `embedded=false`：独立 block，自带 Card 同款外观（border / radius / shadow）。
+export function Collapsible({ title, desc, defaultOpen = false, embedded = false, children }: CollapsibleProps) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div
+      style={{
+        borderBottom: embedded ? '0.5px solid var(--ol-line)' : undefined,
+        border: embedded ? undefined : '0.5px solid var(--ol-line)',
+        borderRadius: embedded ? 0 : 'var(--ol-r-lg)',
+        background: embedded ? 'transparent' : 'var(--ol-surface)',
+        boxShadow: embedded ? 'none' : 'var(--ol-shadow-sm)',
+        overflow: 'hidden',
+        // 父级 flex column 带 minHeight:0 + overflow:auto 时，所有 flex 子项默认
+        // shrink:1，会把 header 按钮也压成一条线。锁住不压缩，溢出走父容器滚动。
+        flexShrink: 0,
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        // 让屏幕阅读器朗读折叠状态；键盘 focus 保留浏览器默认 outline 而不是
+        // outline: 'none'，避免 Tab 切换时丢失视觉焦点指示（pr-agent #407 反馈）。
+        style={{
+          width: '100%',
+          padding: '14px 18px',
+          background: 'transparent',
+          border: 0,
+          textAlign: 'left',
+          fontFamily: 'inherit',
+          color: 'inherit',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+          cursor: 'pointer',
+        }}
+      >
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>{title}</div>
+          {desc && (
+            <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', marginTop: 3, lineHeight: 1.5 }}>{desc}</div>
+          )}
+        </div>
+        <span
+          aria-hidden="true"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 18,
+            height: 18,
+            color: 'var(--ol-ink-4)',
+            transform: open ? 'rotate(90deg)' : 'rotate(0deg)',
+            transition: 'transform 0.18s var(--ol-motion-quick)',
+          }}
+        >
+          <Icon name="chevRight" size={14} />
+        </span>
+      </button>
+      <div
+        style={{
+          display: 'grid',
+          // grid-template-rows: 0fr → 1fr 让浏览器把 1fr 解析为内容实际高度。
+          gridTemplateRows: open ? '1fr' : '0fr',
+          transition: 'grid-template-rows 0.22s var(--ol-motion-soft)',
+        }}
+        // inert 把内部交互元素从 tab 顺序 + a11y 树移除，避免折叠后键盘用户
+        // 仍能 tab 到不可见的输入框 / 按钮 / Toggle（pr-agent #407 反馈）。
+        // 受支持范围：Chromium 102+（Tauri WebView 远高于此）/ Safari 15.4+。
+        // React 18 类型没收 `inert`，用 spread 传 string-boolean 绕过编译器。
+        {...(!open ? { inert: '' } : {})}
+        aria-hidden={!open}
+      >
+        {/* minHeight: 0 必填：默认 grid item 不允许收缩到小于内容固有高度，
+            没这条 trick 不生效，行高动画也跟着失败。 */}
+        <div style={{ overflow: 'hidden', minHeight: 0 }}>
+          <div style={{ padding: '0 18px 18px' }}>{children}</div>
+        </div>
+      </div>
+    </div>
   );
 }

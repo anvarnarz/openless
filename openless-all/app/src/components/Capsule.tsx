@@ -99,8 +99,8 @@ interface CircleButtonProps {
 function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
   const { t } = useTranslation();
   const isCancel = variant === 'cancel';
-  const os = detectOS();
-  const useBackdrop = os !== 'win' && isCancel;
+  // confirm 是主操作锚点，纯白；cancel 半透 + 自带 backdrop blur 跟 pill 拉开层级。
+  const useBackdrop = isCancel;
   return (
     <button
       onClick={enabled ? onClick : undefined}
@@ -195,19 +195,16 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
         >
           <span
             style={{
-              // 放大 11 → 14 让 thinking 在胶囊里更显眼。
-              fontSize: 14,
-              // 字重 500：用户反馈 700 太粗。500 是 medium 视觉重量，扫光更稳。
-              fontWeight: 500,
-              letterSpacing: 0.5,
-              // 字号 14 + 字重 500 时小写 g/y/p 等下伸字符在 line-height: 1 下会被
-              // clip。给 line-height 一点冗余 + 上下 1px padding，descender 不再被切。
+              // v1.3.1-7 用户拍板：黑色底字 + 蓝色扫光（亮黄太显眼，黑底更稳）。
+              // 字号保持 17，字重 700 → 600 稍细一些。
+              fontSize: 17,
+              fontWeight: 600,
+              letterSpacing: 0.3,
+              // line-height: 1 下 g/y/p 等下伸字符会被 clip，给 padding 留 descender 空间。
               paddingBlock: 1,
-              // 扫光：渐变中段用更饱和的 ol-blue（不靠透明度），尾段保留 ink-3 作收尾，
-              // 整条 stripe 比之前更醒目（用户反馈"扫光不够明显"）。
               color: 'var(--ol-ink-2)',
               backgroundImage:
-                'linear-gradient(100deg, var(--ol-ink-3) 0%, var(--ol-ink-3) 35%, var(--ol-blue) 50%, var(--ol-ink-3) 65%, var(--ol-ink-3) 100%)',
+                'linear-gradient(100deg, var(--ol-ink) 0%, var(--ol-ink) 35%, var(--ol-blue) 50%, var(--ol-ink) 65%, var(--ol-ink) 100%)',
               backgroundSize: '220% auto',
               WebkitBackgroundClip: 'text',
               backgroundClip: 'text',
@@ -247,7 +244,7 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
   const ambient = state === 'recording' ? Math.min(1, Math.max(0, level)) : 0;
   const scale = os === 'win' ? 1 : 1 + ambient * 0.018;
   const shadowAlpha = 0.20 + ambient * 0.10;
-  const useBackdrop = os !== 'win';
+  const useBackdrop = true;
 
   return (
     <div
@@ -261,7 +258,7 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
         height: metrics.height,
         boxSizing: metrics.boxSizing,
         borderRadius: 999,
-        background: 'rgba(255, 255, 255, 0.62)',
+        background: 'rgba(255, 255, 255, 0.85)',
         backdropFilter: useBackdrop ? 'blur(28px) saturate(180%)' : 'none',
         WebkitBackdropFilter: useBackdrop ? 'blur(28px) saturate(180%)' : 'none',
         border: '1px solid rgba(255, 255, 255, 0.55)',
@@ -285,15 +282,30 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
   );
 }
 
+// 与 @keyframes capsule-out 的 0.36s 时长一致——必须同步，否则定时器先于
+// 动画结束就 unmount → 用户看到半截动画被截断。
+// v1.3.1-6: 从 240ms 加到 360ms 让用户看清退出动画（240ms 太快感知不到）。
+const EXIT_ANIM_MS = 360;
+// 初始可见 state：Tauri 内运行从 idle 开始（等后端 capsule:state 事件），
+// 浏览器 dev 模式从 recording 开始以便直接看到胶囊。
+const INITIAL_VISIBLE_STATE: CapsuleState = isTauri ? 'idle' : 'recording';
+
 export function Capsule() {
   const { t } = useTranslation();
   const os = detectOS();
   const metrics = getCapsulePillMetrics(os);
-  const [state, setState] = useState<CapsuleState>(isTauri ? 'idle' : 'recording');
+  const [state, setState] = useState<CapsuleState>(INITIAL_VISIBLE_STATE);
   const [level, setLevel] = useState<number>(isTauri ? 0 : 0.6);
   const [insertedChars, setInsertedChars] = useState<number>(0);
   const [message, setMessage] = useState<string | undefined>();
   const [translation, setTranslation] = useState<boolean>(false);
+  // `leaving` 与 `lastVisibleState` 协同实现「退出动画」：
+  // - 当 state 从非 idle 变成 idle 时，不立即卸载，而是把 leaving 置为 true 并保留
+  //   最后一帧的可见 state（lastVisibleState），让胶囊用 capsule-out 动画收缩淡出。
+  // - 动画结束（EXIT_ANIM_MS）后再把 leaving 置回 false，组件回到「真正未挂载」分支。
+  // - 若期间 state 又切回非 idle（例如用户连按热键），立刻中止 leaving 并恢复显示。
+  const [leaving, setLeaving] = useState<boolean>(false);
+  const [lastVisibleState, setLastVisibleState] = useState<CapsuleState>(INITIAL_VISIBLE_STATE);
   // Windows 端 host 在翻译模式从 84 长到 118；macOS / Linux 上 capsuleLayout 已固定 42 忽略此参数。
   const hostMetrics = getCapsuleHostMetrics(os, translation);
 
@@ -320,6 +332,31 @@ export function Capsule() {
     };
   }, []);
 
+  // 退出动画调度：在 state 真正进入 idle 时，先用 capsule-out 播放 EXIT_ANIM_MS，再卸载。
+  // 设计要点：
+  // 1. 进入非 idle：清掉 leaving，记录最新可见 state；
+  // 2. 进入 idle 且之前可见：开启 leaving 并启动定时器；
+  // 3. 期间又被打回非 idle：cleanup 直接 clearTimeout，定时器不会触发，
+  //    新一轮 effect 会立即恢复可见态，避免错误地把可见状态切到 idle。
+  useEffect(() => {
+    if (state !== 'idle') {
+      // 立即恢复可见，并取消上一轮可能挂着的离场。
+      if (leaving) setLeaving(false);
+      setLastVisibleState(state);
+      return undefined;
+    }
+    // state === 'idle'：判断是不是从可见态过渡过来。
+    if (lastVisibleState === 'idle') return undefined;
+    setLeaving(true);
+    const timer = setTimeout(() => {
+      setLeaving(false);
+      setLastVisibleState('idle');
+    }, EXIT_ANIM_MS);
+    return () => clearTimeout(timer);
+    // 故意只依赖 state —— lastVisibleState / leaving 是内部派生量，
+    // 把它们加进依赖会让定时器被反复重建。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
 
   const onCancel = () => {
     void invokeOrMock<void>('cancel_dictation', undefined, () => undefined);
@@ -329,9 +366,13 @@ export function Capsule() {
     void invokeOrMock<void>('stop_dictation', undefined, () => undefined);
   };
 
-  if (state === 'idle') {
+  // 真正卸载：state 已是 idle，且不在离场动画中。
+  if (state === 'idle' && !leaving) {
     return <div style={{ width: 0, height: 0 }} />;
   }
+
+  // 离场时用 lastVisibleState 渲染最后一帧内容，避免把 idle 当作 fallback 走到 AudioBars(0)。
+  const renderedState: CapsuleState = state === 'idle' ? lastVisibleState : state;
 
   return (
     <div
@@ -350,7 +391,19 @@ export function Capsule() {
           : 0,
         paddingBottom: os === 'win' ? hostMetrics.bottomInset : 0,
         background: 'transparent',
-        animation: os === 'win' ? 'none' : 'capsule-in .22s cubic-bezier(.2,.9,.3,1.1)',
+        // 入场：中央 scaleX 由 0.18 长到 1（视觉上像从中心向两端展开）+ 淡入。
+        // 离场：scaleX 由 1 收缩回 0.18 + 向下偏移 8px + 淡出。
+        // 三平台一致 —— 旧版 Windows 走 animation:'none' 的分支已删除。
+        // transformOrigin 默认就是 50% 50%，所以 scaleX 天然以中央为锚点。
+        animation: leaving
+          // v1.3.1-6 调整：
+          // - 入场 .26s → .38s，cubic-bezier 加强 spring overshoot（更曲线感）
+          // - 出场 .24s → .36s（前面 EXIT_ANIM_MS 也同步到 360），曲线改成 ease-in-out 平滑
+          //   收缩 + 下移 + 淡出三段同步进行
+          ? 'capsule-out .36s cubic-bezier(.55,.06,.68,.19) forwards'
+          : 'capsule-in .38s cubic-bezier(.16,.86,.32,1.18) both',
+        transformOrigin: 'center',
+        willChange: 'transform, opacity',
       }}
     >
       {/* "正在翻译" 徽章 — 嵌套两层：
@@ -401,17 +454,26 @@ export function Capsule() {
       </div>
       <Pill
         os={os}
-        state={state}
-        level={level}
+        state={renderedState}
+        level={leaving ? 0 : level}
         insertedChars={insertedChars}
         message={message}
         onCancel={onCancel}
         onConfirm={onConfirm}
       />
       <style>{`
+        /* 入场：从中央很窄的一小条（scaleX 0.18）+ 略压扁（scaleY 0.95）+ 透明，
+           长出到 scaleX 1 / scaleY 1 / 不透明。配合 wrapper 的 transformOrigin:center，
+           视觉上是「从中心向左右展开」。 */
         @keyframes capsule-in {
-          from { opacity: 0; transform: translateY(6px) scale(.96); }
-          to   { opacity: 1; transform: translateY(0) scale(1); }
+          from { opacity: 0; transform: scaleX(.18) scaleY(.95); }
+          to   { opacity: 1; transform: scaleX(1)   scaleY(1); }
+        }
+        /* 离场：scaleX 由 1 收回 0.18 + 整体向下偏移 8px + 淡出。
+           forwards 让最终帧（opacity:0、scaleX:.18）保持到组件被卸载。 */
+        @keyframes capsule-out {
+          from { opacity: 1; transform: scaleX(1)   translateY(0); }
+          to   { opacity: 0; transform: scaleX(.18) translateY(8px); }
         }
         @keyframes cap-shine {
           0%   { background-position: 200% center; }

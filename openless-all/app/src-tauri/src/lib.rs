@@ -12,6 +12,7 @@
 
 mod asr;
 mod audio_mute;
+mod cli;
 mod combo_hotkey;
 mod commands;
 mod coordinator;
@@ -29,6 +30,7 @@ mod recorder;
 mod selection;
 mod shortcut_binding;
 mod types;
+mod unicode_keystroke;
 mod windows_ime_ipc;
 mod windows_ime_profile;
 mod windows_ime_protocol;
@@ -69,7 +71,18 @@ pub fn run() {
         // 单实例锁：第二个进程启动时立即退出，激活信号转给已运行实例的主窗口。
         // 否则两份 OpenLess（如 /Applications/ + dev build）会各自抓全局热键，
         // 导致按一次键、两个进程同时跑流水线、文本被插入两遍。见 issue #50。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        //
+        // 第二个进程的 argv 还有一个用处：作为 Linux/Wayland 下的「触发器入口」。
+        // 桌面环境快捷键执行 `openless --toggle-dictation` 时，第二个进程被本插件
+        // 拦截 → argv 直接转给主实例 coordinator。详见 issue #420 / `cli.rs`。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(intent) = cli::parse_cli_intent(&argv) {
+                log::info!(
+                    "[single-instance] another instance launched with intent={intent:?}, dispatching"
+                );
+                dispatch_cli_intent(app, intent);
+                return;
+            }
             log::info!(
                 "[single-instance] another instance launched, focusing existing main window"
             );
@@ -144,15 +157,15 @@ pub fn run() {
                 #[cfg(target_os = "windows")]
                 {
                     use window_vibrancy::apply_mica;
-                    // The window starts hidden so Windows native chrome can be disabled before
-                    // the first show; doing this after the native frame is visible is unreliable.
-                    if let Err(e) = main.set_decorations(false) {
-                        log::warn!("[main] disable native decorations failed: {e}");
-                    }
+                    // Windows 走 Tauri decorations:true 原生 Win11 标题栏 / 关闭按钮 /
+                    // 拖动 / 圆角 / resize border。保留 apply_mica 给原生 chrome 提供
+                    // 磨砂材质，配合 WindowChrome 半透明 background 让 sidebar 透出玻璃感。
                     if let Err(e) = apply_mica(&main, None) {
                         log::warn!("[main] mica failed: {e}");
                     }
-                    apply_windows_rounded_frame(&main);
+                    // Win11 22H2+: 把原生标题栏底色调成白色，与应用 sidebar 视觉统一。
+                    // 老版 Windows 静默失败，不阻塞。
+                    apply_windows_caption_color(&main);
                 }
                 // 静默启动开关：prefs.start_minimized = true → 不弹主窗口，
                 // 用户从菜单栏 / 托盘点击访问。开机自启时尤其有用，避免每次
@@ -232,6 +245,22 @@ pub fn run() {
                 show_main_window(app.handle());
             }
 
+            // Wayland 下没有可用的全局键盘监听（issue #420）。Coordinator 已通过 stub adapter
+            // 把 hotkey 状态标记为 Installed，整个应用照常起来。前端走 pull 模型：RecordingSection
+            // mount 时调 `is_wayland_cli_mode` 取状态再渲染 CLI 引导 callout。原本用一次性 event 通知
+            // 行不通——Settings 模态是按需 mount，事件不缓冲不 replay，listener 几乎必然错过。
+            if hotkey::is_wayland_session() {
+                log::info!("[startup] Wayland session — frontend will pull via is_wayland_cli_mode");
+            }
+
+            // 首次启动也可能带 CLI flag（用户双击 .desktop 之前先用 CLI 起一遍）。
+            // 等 coordinator 准备好后再 dispatch；GUI 仍然照常起来。
+            let first_run_args: Vec<String> = std::env::args().collect();
+            if let Some(intent) = cli::parse_cli_intent(&first_run_args) {
+                log::info!("[startup] first-run CLI intent={intent:?}, dispatching");
+                dispatch_cli_intent(app.handle(), intent);
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -242,6 +271,7 @@ pub fn run() {
             commands::fetch_latest_beta_release,
             commands::get_hotkey_status,
             commands::get_hotkey_capability,
+            commands::is_wayland_cli_mode,
             commands::set_shortcut_recording_active,
             commands::get_windows_ime_status,
             commands::list_microphone_devices,
@@ -337,16 +367,6 @@ pub fn run() {
                     if let tauri::WindowEvent::CloseRequested { ref api, .. } = event {
                         api.prevent_close();
                         hide_main_window(app);
-                    }
-                    #[cfg(target_os = "windows")]
-                    if matches!(
-                        event,
-                        tauri::WindowEvent::Resized(_)
-                            | tauri::WindowEvent::ScaleFactorChanged { .. }
-                    ) {
-                        if let Some(main) = app.get_webview_window("main") {
-                            apply_windows_rounded_frame(&main);
-                        }
                     }
                 }
             }
@@ -614,93 +634,40 @@ fn handle_style_tray_menu_event(app: &AppHandle, id: &str) -> bool {
     true
 }
 
+/// 把 Win11 原生标题栏底色刷成白色，与应用 sidebar 视觉统一。需要 Win11 22H2+
+/// (Build 22621+) 才支持 `DWMWA_CAPTION_COLOR`(35)；老 Windows 上 DwmSetWindowAttribute
+/// 返回错误，仅打 warn 不阻塞启动。
 #[cfg(target_os = "windows")]
-fn apply_windows_rounded_frame<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+fn apply_windows_caption_color<R: Runtime>(window: &tauri::WebviewWindow<R>) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::{BOOL, HWND, RECT};
-    use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-    };
-    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn, HRGN};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongW, GetWindowRect, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_THICKFRAME,
-    };
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR};
 
     let handle = match window.window_handle().map(|h| h.as_raw()) {
         Ok(RawWindowHandle::Win32(handle)) => handle,
         Ok(other) => {
-            log::warn!("[main] unexpected raw window handle for DWM frame: {other:?}");
+            log::warn!("[main] unexpected raw window handle for caption color: {other:?}");
             return;
         }
         Err(e) => {
-            log::warn!("[main] read raw window handle failed: {e}");
+            log::warn!("[main] read raw window handle for caption color failed: {e}");
             return;
         }
     };
     let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
 
+    // COLORREF 0x00BBGGRR 编码——选用 rgb(245,245,247) 跟 WindowChrome 的 glass linear-gradient
+    // 起始色一致，减小原生 caption bar 跟应用磨砂玻璃的色差（用户反馈：纯白 caption + 半透灰 glass
+    // 色差很丑）。R=0xF5 G=0xF5 B=0xF7 → COLORREF = 0x00F7F5F5。
+    let glass_match: u32 = 0x00F7F5F5;
     unsafe {
-        let style = GetWindowLongW(hwnd, GWL_STYLE);
-        let desired_style = (style | WS_THICKFRAME.0 as i32) & !(WS_CAPTION.0 as i32);
-        if style != desired_style {
-            SetWindowLongW(hwnd, GWL_STYLE, desired_style);
-            if let Err(e) = SetWindowPos(
-                hwnd,
-                HWND::default(),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-            ) {
-                log::warn!("[main] refresh native frame after style update failed: {e}");
-            }
-        }
-
-        if window.is_maximized().unwrap_or(false) {
-            let _ = SetWindowRgn(hwnd, HRGN::default(), BOOL(1));
-            return;
-        }
-
-        let corner_preference = DWMWCP_ROUND;
         if let Err(e) = DwmSetWindowAttribute(
             hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner_preference as *const _ as *const core::ffi::c_void,
-            std::mem::size_of_val(&corner_preference) as u32,
+            DWMWA_CAPTION_COLOR,
+            &glass_match as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&glass_match) as u32,
         ) {
-            log::warn!("[main] set DWM rounded corners failed: {e}");
-        }
-
-        // Remove DWM's fallback 1px light border; the React shell draws the visual stroke.
-        let border_color_none: u32 = 0xFFFFFFFE;
-        if let Err(e) = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &border_color_none as *const _ as *const core::ffi::c_void,
-            std::mem::size_of_val(&border_color_none) as u32,
-        ) {
-            log::warn!("[main] remove DWM border color failed: {e}");
-        }
-
-        let mut rect = RECT::default();
-        if let Err(e) = GetWindowRect(hwnd, &mut rect) {
-            log::warn!("[main] read window rect for rounded region failed: {e}");
-            return;
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width <= 0 || height <= 0 {
-            return;
-        }
-        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 18, 18);
-        if region.is_invalid() {
-            log::warn!("[main] create rounded window region failed");
-            return;
-        }
-        if SetWindowRgn(hwnd, region, BOOL(1)) == 0 {
-            log::warn!("[main] apply rounded window region failed");
+            log::warn!("[main] set caption color failed (likely pre-22H2 Win): {e}");
         }
     }
 }
@@ -815,6 +782,70 @@ pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
         let _ = w.set_focus();
     }
     activate_app(app);
+}
+
+/// 把 CLI intent 路由到 coordinator。两个入口共用：
+/// 1. 首次启动（lib.rs setup 末尾）
+/// 2. single-instance 回调（第二个进程被拦截后转发 argv）
+///
+/// 异步动作（start_dictation / stop_dictation 是 async）通过 tauri 自带 runtime spawn，
+/// 不阻塞回调线程。所有动作都按 coordinator 当前状态自检：
+/// - ToggleDictation 在 Idle → start，在 Listening → stop，Starting/Processing/Inserting 忽略并记日志
+/// - ToggleQa 直接转发到 handle_qa_hotkey_pressed（语义等同于按一次 QA 热键）
+/// - CancelDictation 直接调 cancel（cancel 本身在非 Listening 时也安全）
+fn dispatch_cli_intent<R: Runtime>(app: &AppHandle<R>, intent: cli::CliIntent) {
+    let coordinator = app
+        .try_state::<Arc<coordinator::Coordinator>>()
+        .map(|s| Arc::clone(&*s));
+    let Some(coordinator) = coordinator else {
+        log::warn!("[cli] coordinator not yet managed; dropping intent={intent:?}");
+        return;
+    };
+    match intent {
+        cli::CliIntent::ToggleDictation => {
+            let coord = Arc::clone(&coordinator);
+            tauri::async_runtime::spawn(async move {
+                let phase = coord.dictation_phase_for_cli();
+                use coordinator_state::SessionPhase;
+                match phase {
+                    SessionPhase::Idle => {
+                        log::info!("[cli] toggle-dictation: Idle → start_dictation");
+                        if let Err(e) = coord.start_dictation().await {
+                            log::warn!("[cli] start_dictation failed: {e}");
+                        }
+                    }
+                    SessionPhase::Listening => {
+                        log::info!("[cli] toggle-dictation: Listening → stop_dictation");
+                        if let Err(e) = coord.stop_dictation().await {
+                            log::warn!("[cli] stop_dictation failed: {e}");
+                        }
+                    }
+                    SessionPhase::Starting => {
+                        // 复用 stop_dictation 自身的 Starting → pending_stop 处理，
+                        // 与按一次主热键的行为对齐（issue #51）。
+                        log::info!("[cli] toggle-dictation: Starting → stop_dictation (pending)");
+                        if let Err(e) = coord.stop_dictation().await {
+                            log::warn!("[cli] stop_dictation failed: {e}");
+                        }
+                    }
+                    other => {
+                        log::info!("[cli] toggle-dictation ignored (phase={other:?})");
+                    }
+                }
+            });
+        }
+        cli::CliIntent::ToggleQa => {
+            let coord = Arc::clone(&coordinator);
+            tauri::async_runtime::spawn(async move {
+                log::info!("[cli] toggle-qa: dispatching to qa hotkey handler");
+                coord.cli_toggle_qa_panel().await;
+            });
+        }
+        cli::CliIntent::CancelDictation => {
+            log::info!("[cli] cancel-dictation: invoking cancel");
+            coordinator.cancel_dictation();
+        }
+    }
 }
 
 pub(crate) fn request_microphone_from_foreground<R: Runtime>(

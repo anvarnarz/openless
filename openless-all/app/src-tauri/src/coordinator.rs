@@ -745,6 +745,22 @@ impl Coordinator {
         cancel_session(&self.inner);
     }
 
+    /// 返回当前听写阶段（read-only 快照），供 CLI 入口在 dispatch toggle 时决策。
+    /// 与原热键边沿走的 `handle_pressed` 分支完全相同的判定逻辑：Idle → start，
+    /// Listening → stop。Linux/Wayland 下桌面快捷键 → CLI 转发是唯一触发路径，
+    /// 必须复用这套语义。
+    pub fn dictation_phase_for_cli(&self) -> SessionPhase {
+        self.inner.state.lock().phase
+    }
+
+    /// CLI 入口的 QA toggle：直接复用 modifier-only QA 热键边沿的处理函数。
+    /// 与 `handle_qa_hotkey_pressed` 同语义 — Idle → 开浮窗 / Recording → 收尾 /
+    /// Processing → 忽略。Wayland 下没有 modifier-only / global-hotkey 监听，CLI
+    /// 是唯一进入点。
+    pub async fn cli_toggle_qa_panel(&self) {
+        handle_qa_hotkey_pressed(&self.inner).await;
+    }
+
     pub fn set_shortcut_recording_active(&self, active: bool) {
         self.inner
             .shortcut_recording_active
@@ -2015,6 +2031,105 @@ fn ensure_qa_volcengine_credentials() -> Result<(), String> {
 
 /// 润色文本；失败时返回原文 + 失败原因，调用方据此弹错误胶囊 + 写历史 error_code。
 /// 之前固定返回 String，调用方拿不到失败信号 → 用户感知"为什么风格设置没生效"。issue #57。
+/// 流式润色的三态结果。让上层（dictation pipeline）能区分「已经流出去了」、
+/// 「降级到一次性」和「真失败了走 raw 兜底」三种 case。
+pub enum StreamingPolishOutcome {
+    /// 流式润色成功，`String` 是已经一边流一边交给 `on_delta` 的全部文本（用于写
+    /// history、做词条命中统计）。调用方不应再 `inserter.insert(&text)`，因为字符
+    /// 已经通过键盘事件落到光标处。
+    Streamed(String),
+    /// 当前配置不支持流式：用户没开 streaming_insert / Gemini provider / Codex
+    /// provider / Raw 模式 / 翻译模式 / 不是 macOS。调用方应回到现有的
+    /// `polish_or_passthrough` 一次性路径，跟历史行为完全一致。
+    UnsupportedFallback,
+    /// 流式过程中失败（HTTP / 解析 / 空流等）。`String` 是失败原因，调用方应当
+    /// 走 raw 兜底（同 `polish_or_passthrough` 失败分支的语义）。
+    Failed(String),
+}
+
+/// 流式润色入口。在不支持流式的所有 case 都返回 `UnsupportedFallback`，让调用方
+/// 透明降级。不修改任何持久化 / 焦点 / 光标状态。
+///
+/// `on_delta` 每收到一个 SSE chunk 就被调用一次（同步），调用方负责把 chunk 实际
+/// 模拟键盘事件落到光标 —— 见 `coordinator/dictation.rs` 的流式分支。
+/// `should_cancel` 用户取消时返回 true，立即 break SSE 读循环避免烧 quota。
+pub async fn polish_or_passthrough_streaming<F, C>(
+    raw: &RawTranscript,
+    mode: PolishMode,
+    hotwords: &[String],
+    working_languages: &[String],
+    chinese_script_preference: ChineseScriptPreference,
+    output_language_preference: OutputLanguagePreference,
+    llm_thinking_enabled: bool,
+    front_app: Option<&str>,
+    prior_turns: &[(String, String)],
+    on_delta: F,
+    should_cancel: C,
+) -> StreamingPolishOutcome
+where
+    F: Fn(&str) + Send + Sync,
+    C: Fn() -> bool + Send + Sync,
+{
+    if mode == PolishMode::Raw {
+        log::info!("[coord] streaming polish skipped: mode=Raw, fall back to one-shot");
+        return StreamingPolishOutcome::UnsupportedFallback;
+    }
+    let active_llm = CredentialsVault::get_active_llm();
+    if active_llm == "gemini" {
+        log::info!(
+            "[coord] streaming polish skipped: active LLM provider=gemini (v1 not implemented), fall back to one-shot"
+        );
+        return StreamingPolishOutcome::UnsupportedFallback;
+    }
+    let provider = match build_active_llm_provider(llm_thinking_enabled) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("[coord] streaming polish: build provider failed: {e}");
+            return StreamingPolishOutcome::Failed(e.to_string());
+        }
+    };
+    if !provider.supports_streaming_polish() {
+        log::info!(
+            "[coord] streaming polish skipped: provider does not support streaming (likely codex OAuth), fall back to one-shot"
+        );
+        return StreamingPolishOutcome::UnsupportedFallback;
+    }
+    log::info!(
+        "[coord] streaming polish START: provider=openai-compatible mode={:?} raw_chars={} prior_turns={}",
+        mode,
+        raw.text.chars().count(),
+        prior_turns.len()
+    );
+    match provider
+        .polish_streaming(
+            &raw.text,
+            mode,
+            hotwords,
+            working_languages,
+            chinese_script_preference,
+            output_language_preference,
+            front_app,
+            prior_turns,
+            on_delta,
+            should_cancel,
+        )
+        .await
+    {
+        Ok(text) => {
+            log::info!(
+                "[coord] streaming polish OK: final_chars={}",
+                text.chars().count()
+            );
+            StreamingPolishOutcome::Streamed(text)
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            log::error!("[coord] streaming polish FAILED: {reason}");
+            StreamingPolishOutcome::Failed(reason)
+        }
+    }
+}
+
 async fn polish_or_passthrough(
     raw: &RawTranscript,
     mode: PolishMode,

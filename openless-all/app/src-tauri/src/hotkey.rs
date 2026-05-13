@@ -173,6 +173,21 @@ impl Drop for HotkeyMonitor {
     }
 }
 
+/// 是否处于 Wayland session。Linux 以外的平台恒返回 false。
+///
+/// 主用途：`lib.rs` 在 hotkey listener 起好后据此决定是否额外 emit
+/// `wayland_cli_mode` 事件，让前端 Settings 面板展示「请绑桌面快捷键到
+/// `openless --toggle-dictation`」的引导文案。
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+pub fn is_wayland_session() -> bool {
+    std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland")
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn is_wayland_session() -> bool {
+    false
+}
+
 fn install_error(code: &str, message: impl Into<String>) -> HotkeyInstallError {
     HotkeyInstallError {
         code: code.into(),
@@ -1197,15 +1212,26 @@ mod platform {
     };
     use crate::types::{HotkeyAdapterKind, HotkeyBinding, HotkeyInstallError, HotkeyTrigger};
 
+    /// X11 走 rdev 监听器；Wayland 协议层面禁止应用监听其他窗口的键盘事件
+    /// （详见 `docs/issue-420-wayland-hotkey-research.md` 2 节），所以这里
+    /// 返回一个"CLI 适配器"占位：不安装任何键盘 hook，但实现 HotkeyAdapter
+    /// trait 以让上层 `ensure_modifier_hotkey_monitor` 正常走 `Installed` 分支，
+    /// 不再把 Wayland 当成"安装失败"。
+    ///
+    /// 用户实际的触发路径变成：桌面环境快捷键 → `openless --toggle-dictation`
+    /// → tauri-plugin-single-instance 拦截并把 argv 转给主实例 coordinator。
+    /// 前端 Settings 面板会监听 `wayland_cli_mode` 事件并展示对应的引导文案。
     pub fn start_adapter(
         binding: HotkeyBinding,
         tx: Sender<HotkeyEvent>,
     ) -> Result<Box<dyn HotkeyAdapter>, HotkeyInstallError> {
-        if std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland") {
-            return Err(install_error(
-                "wayland_unsupported",
-                "Wayland 暂不支持全局热键，请切到 X11 session 后再试",
-            ));
+        if super::is_wayland_session() {
+            log::info!(
+                "[hotkey] Wayland session detected; rdev listener skipped — \
+                 use desktop shortcut → `openless --toggle-dictation` instead (issue #420)"
+            );
+            // tx 在 stub adapter 下无人 push 事件 — 持有它直到 adapter 被 drop 即可。
+            return Ok(Box::new(WaylandCliAdapter { _tx: tx }));
         }
         let listener = start_listener_thread(
             binding,
@@ -1218,6 +1244,35 @@ mod platform {
         Ok(Box::new(RdevHotkeyAdapter {
             shared: listener.shared,
         }))
+    }
+
+    /// Wayland 下的占位 adapter：实现接口但不监听键盘。
+    /// 上层 coordinator 仍会把它登记为 `Installed`（hotkey 状态显示正常），
+    /// 用户的触发路径由 CLI + single-instance 转发承担。
+    struct WaylandCliAdapter {
+        _tx: Sender<HotkeyEvent>,
+    }
+
+    impl HotkeyAdapter for WaylandCliAdapter {
+        fn kind(&self) -> HotkeyAdapterKind {
+            // 复用 Rdev kind 显示，避免新增枚举项波及整个序列化层。
+            // 真实 adapter 状态由 `wayland_cli_mode` 事件在前端单独引导。
+            HotkeyAdapterKind::Rdev
+        }
+
+        fn update_binding(&self, _binding: HotkeyBinding) {
+            // Wayland 下绑定由桌面环境管理；忽略后端绑定变更，但不报错。
+        }
+
+        fn update_modifier_shortcuts(
+            &self,
+            _qa_trigger: Option<HotkeyTrigger>,
+            _translation_trigger: Option<HotkeyTrigger>,
+        ) {
+            // 同上 — modifier-only 修饰键在 Wayland 上也走不通，留空。
+        }
+
+        fn reset_held_state(&self) {}
     }
 
     struct RdevHotkeyAdapter {
